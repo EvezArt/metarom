@@ -10,13 +10,7 @@ pub enum GapSeverity {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GapKind {
-    Cpu,
-    Gpu,
-    Memory,
-    Runtime,
-    Io,
-    Timing,
-    Legal,
+    Cpu, Gpu, Memory, Runtime, Io, Timing, Legal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,14 +96,22 @@ fn analyze_cpu_gap(game: &GameRequirement, target: &CapabilityGraph) -> GapStatu
     let isa_match = game.cpu.required_isa.iter().any(|req| {
         target.cpu.isas.iter().any(|isa| isa.eq_ignore_ascii_case(req))
     });
-    if !isa_match { return GapStatus::hard(GapReason::new("ISA_MISMATCH")); }
+    if !isa_match {
+        return GapStatus::hard(GapReason::new("ISA_MISMATCH"));
+    }
     if target.cpu.cores < game.cpu.min_cores {
-        return GapStatus::soft(GapReason::with_detail("CPU_CORE_COUNT_LOW",
-            format!("need {}, have {}", game.cpu.min_cores, target.cpu.cores)));
+        return GapStatus::soft(GapReason::with_detail(
+            "CPU_CORE_COUNT_LOW",
+            format!("need {}, have {}", game.cpu.min_cores, target.cpu.cores),
+        ));
     }
     if let Some(simd_req) = &game.cpu.simd_required {
-        let simd_ok = simd_req.iter().all(|r| target.cpu.simd.iter().any(|s| s.eq_ignore_ascii_case(r)));
-        if !simd_ok { return GapStatus::soft(GapReason::new("SIMD_FEATURE_GAP")); }
+        let simd_ok = simd_req.iter().all(|r| {
+            target.cpu.simd.iter().any(|s| s.eq_ignore_ascii_case(r))
+        });
+        if !simd_ok {
+            return GapStatus::soft(GapReason::new("SIMD_FEATURE_GAP"));
+        }
     }
     GapStatus::none()
 }
@@ -136,8 +138,10 @@ fn analyze_gpu_gap(game: &GameRequirement, target: &CapabilityGraph) -> GapStatu
 
 fn analyze_memory_gap(game: &GameRequirement, target: &CapabilityGraph) -> GapStatus {
     if target.memory.ram_mb < game.memory.ram_min_mb {
-        return GapStatus::hard(GapReason::with_detail("RAM_BELOW_MIN",
-            format!("need {}MB, have {}MB", game.memory.ram_min_mb, target.memory.ram_mb)));
+        return GapStatus::hard(GapReason::with_detail(
+            "RAM_BELOW_MIN",
+            format!("need {}MB, have {}MB", game.memory.ram_min_mb, target.memory.ram_mb),
+        ));
     }
     let mut soft = GapStatus::none();
     if let Some(req_mbps) = game.memory.streaming_read_mbps {
@@ -167,11 +171,11 @@ fn analyze_runtime_gap(game: &GameRequirement, target: &CapabilityGraph) -> GapS
 }
 
 fn analyze_io_gap(game: &GameRequirement, target: &CapabilityGraph) -> GapStatus {
-    let missing_inputs: Vec<String> = game.io.required_inputs.iter()
+    let missing: Vec<String> = game.io.required_inputs.iter()
         .filter(|req| !target.io.inputs.iter().any(|i| i.eq_ignore_ascii_case(req)))
         .cloned().collect();
-    if !missing_inputs.is_empty() {
-        return GapStatus::soft(GapReason::with_detail("MISSING_INPUTS", format!("{missing_inputs:?}")));
+    if !missing.is_empty() {
+        return GapStatus::soft(GapReason::with_detail("MISSING_INPUTS", format!("{missing:?}")));
     }
     if game.io.online_required && !target.io.network.available {
         return GapStatus::hard(GapReason::new("ONLINE_REQUIRED_NETWORK_UNAVAILABLE"));

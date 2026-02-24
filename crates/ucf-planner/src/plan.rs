@@ -1,8 +1,5 @@
 use crate::gap::{GapKind, GapSeverity, GapVector};
-use crate::model::{
-    CompatibilityPlan, Degradation, EquivalenceLevel, GameRequirement, NetworkRequirements,
-    UserRequirements, VerificationTarget,
-};
+use crate::model::{CompatibilityPlan, Degradation, EquivalenceLevel, GameRequirement, NetworkRequirements, UserRequirements, VerificationTarget};
 use crate::strategy::Strategy;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -47,7 +44,6 @@ impl PlanCandidate {
 pub fn default_compensation_map_for(strategy: Strategy, gaps: &GapVector) -> CompensationMap {
     let mut map: CompensationMap = BTreeMap::new();
     let mut push = |k: GapKind, c: Compensation| { map.entry(k).or_default().push(c); };
-
     if gaps.cpu.severity != GapSeverity::None {
         match strategy {
             Strategy::Emulate | Strategy::EmulatePlusTranslate => push(GapKind::Cpu, Compensation::Emulation),
@@ -79,7 +75,7 @@ pub fn default_compensation_map_for(strategy: Strategy, gaps: &GapVector) -> Com
     }
     if gaps.io.severity != GapSeverity::None {
         match strategy {
-            Strategy::StreamingRecommended | Strategy::SplitExecutionRecommended => { push(GapKind::Io, Compensation::RemoteInputBridge); }
+            Strategy::StreamingRecommended | Strategy::SplitExecutionRecommended => push(GapKind::Io, Compensation::RemoteInputBridge),
             _ => { push(GapKind::Io, Compensation::InputMapper); push(GapKind::Io, Compensation::VirtualInput); }
         }
     }
@@ -103,12 +99,8 @@ pub fn default_compensation_map_for(strategy: Strategy, gaps: &GapVector) -> Com
 }
 
 pub fn build_compatibility_plan(
-    candidate: PlanCandidate,
-    game: &GameRequirement,
-    target: &crate::model::CapabilityGraph,
-    helpers: &[crate::model::CapabilityGraph],
-    gaps: &GapVector,
-    mode_id: Option<&str>,
+    candidate: PlanCandidate, game: &GameRequirement, target: &crate::model::CapabilityGraph,
+    helpers: &[crate::model::CapabilityGraph], gaps: &GapVector, mode_id: Option<&str>,
 ) -> CompatibilityPlan {
     let equivalence_min = resolve_equivalence_level(game, mode_id);
     CompatibilityPlan {
@@ -124,10 +116,7 @@ pub fn build_compatibility_plan(
         degradations: candidate.degradations,
         requirements_for_user: candidate.user_requirements,
         scores: candidate.scores,
-        verification_target: VerificationTarget {
-            equivalence_min,
-            test_profile: "smoke_plus_input_latency".into(),
-        },
+        verification_target: VerificationTarget { equivalence_min, test_profile: "smoke_plus_input_latency".into() },
         confidence: candidate.confidence,
     }
 }
@@ -138,7 +127,5 @@ fn resolve_equivalence_level(game: &GameRequirement, mode_id: Option<&str>) -> E
             return m.acceptable_equivalence_min.clone();
         }
     }
-    game.fidelity_modes.first()
-        .map(|m| m.acceptable_equivalence_min.clone())
-        .unwrap_or(EquivalenceLevel::L2_INTERACTIVE)
+    game.fidelity_modes.first().map(|m| m.acceptable_equivalence_min.clone()).unwrap_or(EquivalenceLevel::L2_INTERACTIVE)
 }
