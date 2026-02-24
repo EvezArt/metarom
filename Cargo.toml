@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/gb-core",
     "crates/ucf-planner",
     "crates/mrom-ecore-abi",
 ]
