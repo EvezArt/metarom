@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://ucf/capability_graph.schema.json",
+  "title": "UCF CapabilityGraph",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capability_version",
+    "platform_id",
+    "label",
+    "class",
+    "host_os",
+    "cpu",
+    "gpu",
+    "memory",
+    "io",
+    "timing",
+    "security",
+    "legal",
+    "profiles"
+  ],
+  "properties": {
+    "capability_version": {
+      "type": "string",
+      "pattern": "^0\\.1$"
+    },
+    "platform_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1
+    },
+    "class": {
+      "type": "string",
+      "enum": [
+        "pc",
+        "console",
+        "handheld",
+        "mobile",
+        "server",
+        "embedded",
+        "other"
+      ]
+    },
+    "host_os": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "version",
+        "abi",
+        "syscalls"
+      ],
+      "properties": {
+        "family": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "abi": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "syscalls": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "cpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isas",
+        "cores",
+        "threads",
+        "clock_mhz",
+        "simd",
+        "features"
+      ],
+      "properties": {
+        "isas": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "cores": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "threads": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "clock_mhz": {
+          "type": "number",
+          "minimum": 0
+        },
+        "simd": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "gpu": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "apis",
+        "shader_models",
+        "features",
+        "vram_mb",
+        "throughput_hint"
+      ],
+      "properties": {
+        "apis": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "shader_models": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "features": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "vram_mb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "throughput_hint": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ram_mb",
+        "bandwidth_gbps",
+        "storage"
+      ],
+      "properties": {
+        "ram_mb": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "bandwidth_gbps": {
+          "type": "number",
+          "minimum": 0
+        },
+        "storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "internal_mb",
+            "streaming_read_mbps",
+            "seek_latency_ms"
+          ],
+          "properties": {
+            "internal_mb": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "streaming_read_mbps": {
+              "type": "number",
+              "minimum": 0
+            },
+            "seek_latency_ms": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "io": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inputs",
+        "audio_out",
+        "video_out",
+        "network"
+      ],
+      "properties": {
+        "inputs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "audio_out": {
+          "type": "boolean"
+        },
+        "video_out": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "network": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "available"
+          ],
+          "properties": {
+            "available": {
+              "type": "boolean"
+            },
+            "bandwidth_mbps": {
+              "type": "number",
+              "minimum": 0
+            },
+            "rtt_ms": {
+              "type": "number",
+              "minimum": 0
+            },
+            "jitter_ms": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display_modes_hz",
+        "timer_resolution_us",
+        "interrupt_model"
+      ],
+      "properties": {
+        "display_modes_hz": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 1
+          }
+        },
+        "timer_resolution_us": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "interrupt_model": {
+          "type": "string"
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unsigned_code_allowed",
+        "external_coprocessor_support"
+      ],
+      "properties": {
+        "unsigned_code_allowed": {
+          "type": "boolean"
+        },
+        "external_coprocessor_support": {
+          "type": "string",
+          "enum": [
+            "yes",
+            "no",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "legal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "firmware_required",
+        "redistributable_firmware"
+      ],
+      "properties": {
+        "firmware_required": {
+          "type": "boolean"
+        },
+        "redistributable_firmware": {
+          "type": "boolean"
+        }
+      }
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "measured",
+        "source"
+      ],
+      "properties": {
+        "measured": {
+          "type": "boolean"
+        },
+        "source": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "mrom-ecore-abi"
+version = "0.1.0"
+edition = "2021"
+description = "MetaROM emulator-core ABI — stable FFI interface for .mrom arcade cart modules"
+license = "AGPL-3.0"
+
+[lib]
+name = "mrom_ecore_abi"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

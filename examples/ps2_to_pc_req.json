@@ -1,0 +1,70 @@
+{
+  "requirement_version": "0.1",
+  "artifact_id": "silent_hill_2_ps2",
+  "kind": "game_binary",
+  "source_type": "binary_only",
+  "targets_original": [
+    "ps2"
+  ],
+  "cpu": {
+    "required_isa": [
+      "mips_r5900"
+    ],
+    "min_cores": 1,
+    "threading_model": "multi_threaded"
+  },
+  "gpu": {
+    "required_apis": [
+      "gs_rasterizer"
+    ],
+    "features_required": {
+      "framebuffer_effects": true
+    },
+    "vram_min_mb": 4
+  },
+  "memory": {
+    "ram_min_mb": 32
+  },
+  "runtime": {
+    "os_families": [
+      "ps2_ee"
+    ],
+    "anti_cheat": false
+  },
+  "io": {
+    "required_inputs": [
+      "dualshock2"
+    ],
+    "online_required": false
+  },
+  "timing": {
+    "target_fps": 30.0,
+    "frame_pacing_sensitive": true
+  },
+  "fidelity_modes": [
+    {
+      "mode_id": "gameplay",
+      "priority": "gameplay",
+      "acceptable_equivalence_min": "L3_GAMEPLAY_EQ",
+      "split_execution": {
+        "preferred_mode": "hybrid_prediction",
+        "rollback_window_frames_target": 4,
+        "rollback_window_frames_max": 8
+      }
+    },
+    {
+      "mode_id": "archival",
+      "priority": "archival",
+      "acceptable_equivalence_min": "L5_BIT_EXACT",
+      "split_execution": {
+        "preferred_mode": "streaming_full",
+        "rollback_window_frames_target": 0
+      }
+    }
+  ],
+  "extractor_confidence": {
+    "static_analysis": 0.82,
+    "runtime_probe": 0.91,
+    "trace_inference": 0.74
+  }
+}

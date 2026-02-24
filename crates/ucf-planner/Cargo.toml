@@ -1,0 +1,19 @@
+[package]
+name = "ucf-planner"
+version = "0.1.0"
+edition = "2021"
+description = "Universal Compatibility Fabric — planning engine for cross-generation execution"
+license = "AGPL-3.0"
+
+[[bin]]
+name = "ucf-planner"
+path = "src/main.rs"
+
+[lib]
+name = "ucf_planner"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://ucf/sts_profile.schema.json",
+  "title": "UCF Semantic Tick Scaling Profile",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "sts_version",
+    "profile_id",
+    "target_budget",
+    "subsystems"
+  ],
+  "properties": {
+    "sts_version": {
+      "type": "string",
+      "pattern": "^0\\.1(-exp)?$"
+    },
+    "profile_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "target_budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "frame_ms"
+      ],
+      "properties": {
+        "frame_ms": {
+          "type": "number",
+          "minimum": 1
+        },
+        "cpu_budget_ms": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gpu_budget_ms": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "subsystems": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "priority",
+          "min_tick_hz",
+          "degrade"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "min_tick_hz": {
+            "type": "number",
+            "minimum": 0
+          },
+          "max_tick_hz": {
+            "type": "number",
+            "minimum": 0
+          },
+          "degrade": {
+            "type": "string",
+            "enum": [
+              "none",
+              "interpolate",
+              "duty_cycle",
+              "drop_density",
+              "refresh_skip",
+              "reduce_precision",
+              "bake",
+              "cull_background",
+              "fallback_lod"
+            ]
+          },
+          "gameplay_critical": {
+            "type": "boolean",
+            "default": false
+          },
+          "rollback_sensitive": {
+            "type": "boolean",
+            "default": false
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
