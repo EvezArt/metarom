@@ -1,16 +1,15 @@
 [package]
 name = "gb-core"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
-description = "MetaROM Game Boy / Game Boy Color emulator core (UCF-compatible)"
-license = "AGPL-3.0"
+description = "MetaROM Game Boy emulator core — Phase 3: PPU + APU + Timer + MBC + CB decode"
 
-[dependencies]
+[[bin]]
+name = "letsplay"
+path = "src/bin/letsplay.rs"
 
 [lib]
 name = "gb_core"
 path = "src/lib.rs"
 
-[[test]]
-name = "smoke"
-path = "tests/smoke.rs"
+[dependencies]
