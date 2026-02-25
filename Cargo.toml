@@ -5,3 +5,7 @@ members = [
     "crates/ucf-planner",
     "crates/mrom-ecore-abi",
 ]
+
+[profile.release]
+opt-level = 3
+lto = true

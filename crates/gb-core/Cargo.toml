@@ -1,12 +1,20 @@
 [package]
 name = "gb-core"
-version = "0.3.0"
+version = "0.5.0"
 edition = "2021"
-description = "MetaROM Game Boy emulator core — Phase 3: PPU + APU + Timer + MBC + CB decode"
+description = "MetaROM Game Boy emulator core — Phase 5"
 
 [[bin]]
 name = "letsplay"
 path = "src/bin/letsplay.rs"
+
+[[bin]]
+name = "letsplay_train"
+path = "src/bin/letsplay_train.rs"
+
+[[bin]]
+name = "letsplay_batch"
+path = "src/bin/letsplay_batch.rs"
 
 [lib]
 name = "gb_core"

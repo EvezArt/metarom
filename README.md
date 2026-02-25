@@ -13,71 +13,81 @@ Every ROM that runs through the emulator becomes a training file. That's the law
 ```
 metarom/
 ├── schemas/
-│   ├── capability_graph.schema.json   # Target platform descriptor
-│   ├── game_requirement.schema.json   # Game/artifact requirements
-│   ├── sts_profile.schema.json        # Semantic Tick Scaling profile
-│   └── training_record.schema.json    # .mrom.train.json schema (Phase 4)
+│   ├── capability_graph.schema.json
+│   ├── game_requirement.schema.json
+│   ├── sts_profile.schema.json
+│   └── training_record.schema.json    # .mrom.train.json schema (Phase 4+)
 ├── crates/
 │   ├── gb-core/                       # Game Boy emulator core
 │   │   └── src/
-│   │       ├── lib.rs                 # Phase 4: PPU+OAM+Window, APU channels, training
+│   │       ├── lib.rs                 # Phase 5: full SM83, APU HW timers, training
 │   │       └── bin/
 │   │           ├── letsplay.rs        # ASCII frame renderer
-│   │           └── letsplay_train.rs  # Training data extractor (Phase 4)
-│   ├── ucf-planner/                   # UCF planning engine (CLI + library)
+│   │           ├── letsplay_train.rs  # Single-ROM training extractor
+│   │           └── letsplay_batch.rs  # Batch ROM-to-training runner (Phase 5)
+│   ├── ucf-planner/                   # UCF planning engine
 │   └── mrom-ecore-abi/                # C-ABI for .mrom arcade cart modules
 └── examples/
-    └── ps2_to_pc_req.json             # Example planning request
+    └── ps2_to_pc_req.json
 ```
 
-## Phase 4 Features
+## Phase 5 Features
 
-- **OAM sprite rendering** — 40 sprite limit, 8x8/8x16 modes, X/Y flip, BG priority, per-sprite palette
-- **Window layer** — WY/WX registers, internal line counter (wlc), correct window tile map select
-- **Full palette registers** — BGP (FF47), OBP0 (FF48), OBP1 (FF49)
-- **APU channels** — Square1, Square2, Wave, Noise with per-channel sample output
-- **APU sample buffer** — 48kHz stereo PCM, drain_samples() API
-- **Training extractor** — `letsplay_train` binary plays any ROM → `.mrom.train.json`
-- **Training schema** — `schemas/training_record.schema.json` defines the v1 record format
+- **Full SM83 instruction set** — all 251 opcodes correctly implemented via `exec_op()`
+  - Complete LD r8/r8 grid (64 instructions, 0x40–0x7F)
+  - Full ALU grid: ADD/ADC/SUB/SBC/AND/XOR/OR/CP with r8 and d8 operands (0x80–0xBF, 0xC6–0xFE)
+  - All flag-correct arithmetic: half-carry, carry, zero, subtract
+  - **DAA** (BCD correction) — complete implementation
+  - **PUSH/POP** all register pairs including AF (with F lower nibble mask)
+  - Conditional jumps: JP cc, JR cc with taken/not-taken cycle counts
+  - Conditional CALL cc (24 cycles taken, 12 not-taken)
+  - Conditional RET cc (20 cycles taken, 8 not-taken)
+  - RST handlers, LDH, LD (C)/A, ADD SP/e8, LD HL SP+e8
+- **APU frame sequencer** — 512Hz hardware timer (every 8192 cycles)
+  - Length counter: clocks at steps 0, 2, 4, 6 — disables channel at zero
+  - Frequency sweep (Square1 NR10): clocks at steps 2, 6
+  - Envelope: clocks at step 7 — volume ramp up/down per channel
+  - sweep_shadow register, sweep_enabled, sweep_timer
+- **Batch ROM runner** — `letsplay_batch` processes entire ROM directories
+  - One `.mrom.train.json` per ROM, written to output directory
+  - `batch_manifest.json` — summary of all runs (title, epoch, frames, ok/fail)
+  - Handles .gb, .gbc, .rom extensions
+  - Graceful error handling per ROM (bad ROM doesn't stop batch)
 
 ## Quick start
 
 ```bash
-# Build all crates
+# Build all
 cargo build
 
-# Play synthetic ROM (ASCII output, 10 frames)
-cargo run --bin letsplay -- 10
-
-# Extract training data (60 frames → JSON)
+# Single ROM training (60 frames)
 cargo run --bin letsplay_train -- 60 output.mrom.train.json
 
-# Run a plan (UCF planner)
+# Batch: process every .gb/.gbc in roms/ → training_output/
+cargo run --bin letsplay_batch -- roms/ training_output/ 300
+
+# ASCII renderer
+cargo run --bin letsplay -- 10
+
+# UCF planner
 cargo run -p ucf-planner -- plan --artifact examples/game_req.json --target examples/pc_cap.json
 ```
 
 ## Training pipeline
 
-Every ROM run produces a `.mrom.train.json` file:
+```
+roms/
+├── tetris.gb      ──→  training_output/tetris.mrom.train.json
+├── zelda.gb       ──→  training_output/zelda.mrom.train.json
+└── pokemon.gb     ──→  training_output/pokemon.mrom.train.json
+                         training_output/batch_manifest.json
 
-```json
-{
-  "version": "mrom.train.v1",
-  "rom_title": "EVEZ-OS-TRAIN",
-  "epoch": "gen1_nes",
-  "total_frames": 60,
-  "frames": [
-    { "frame": 0, "t_cycles": 70224, "pc": 352, "ly": 144, "ppu_mode": 1, ... },
-    ...
-  ]
-}
+Each .mrom.train.json feeds into EVEZ-OS console_war_trainer for epoch progression.
 ```
 
 Epoch classification:
 - `gen1_nes` — DMG cartridges (non-CGB)
 - `gen2_snes_genesis` — CGB cartridges
-
-These feed directly into the EVEZ-OS `console_war_trainer` for epoch progression.
 
 ## Architecture
 

@@ -258,14 +258,7 @@ impl Ppu {
     }
 }
 
-// ── APU stub ──────────────────────────────────────────────────────────────────
-#[derive(Debug, Clone, Default)]
-pub struct Apu { pub power: bool, pub master_vol: u8 }
-impl Apu {
-    pub fn write_reg(&mut self, r: u8, v: u8) {
-        match r { 0x24=>self.master_vol=v, 0x26=>self.power=v&0x80!=0, _=>{} }
-    }
-}
+// ── APU defined below (Phase 4/5) ──────────────────────────────────────────
 
 // ── Timer ─────────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Default)]
@@ -632,6 +625,7 @@ pub struct Square {
     pub nr0: u8, pub nr1: u8, pub nr2: u8, pub nr3: u8, pub nr4: u8,
     pub enabled: bool, pub freq_timer: u32, pub duty_pos: u8,
     pub volume: u8, pub env_timer: u8, pub len_timer: u16,
+    pub sweep_shadow: u16, pub sweep_timer: u8, pub sweep_enabled: bool,
 }
 impl Square {
     fn period(&self) -> u32 {
@@ -680,7 +674,7 @@ impl WaveChannel {
 #[derive(Debug, Clone, Default)]
 pub struct NoiseChannel {
     pub enabled: bool, pub nr1: u8, pub nr2: u8, pub nr3: u8, pub nr4: u8,
-    pub lfsr: u16, pub freq_timer: u32, pub volume: u8,
+    pub lfsr: u16, pub freq_timer: u32, pub volume: u8, pub env_timer: u8,
 }
 impl NoiseChannel {
     pub fn tick(&mut self) {
@@ -706,6 +700,7 @@ pub struct Apu {
     pub sq1: Square, pub sq2: Square, pub wave: WaveChannel, pub noise: NoiseChannel,
     pub sample_buffer: Vec<i16>,
     sample_timer: u32,
+    pub fs_counter: u8, pub wave_len: u16, pub noise_len: u16, pub fs_div: u32,
 }
 impl Default for Apu {
     fn default() -> Self {
@@ -745,6 +740,47 @@ impl Apu {
             0x30..=0x3F=>self.wave.wave_ram[(r-0x30) as usize]=v,
             _=>{}
         }
+    }
+    pub fn step_with_fs(&mut self, cycles: u8) {
+        self.step(cycles);
+        self.fs_div += cycles as u32;
+        while self.fs_div >= 8192 {
+            self.fs_div -= 8192;
+            self.frame_seq_step();
+        }
+    }
+    pub fn frame_seq_step(&mut self) {
+        self.fs_counter = (self.fs_counter + 1) & 7;
+        let s = self.fs_counter;
+        if s & 1 == 0 { self.clock_len(); }
+        if s == 2 || s == 6 { self.clock_sweep(); }
+        if s == 7 { self.clock_env(); }
+    }
+    fn clock_len(&mut self) {
+        if self.sq1.nr4&0x40!=0&&self.sq1.len_timer>0{self.sq1.len_timer-=1;if self.sq1.len_timer==0{self.sq1.enabled=false;}}
+        if self.sq2.nr4&0x40!=0&&self.sq2.len_timer>0{self.sq2.len_timer-=1;if self.sq2.len_timer==0{self.sq2.enabled=false;}}
+        if self.wave.nr4&0x40!=0&&self.wave_len>0{self.wave_len-=1;if self.wave_len==0{self.wave.enabled=false;}}
+        if self.noise.nr4&0x40!=0&&self.noise_len>0{self.noise_len-=1;if self.noise_len==0{self.noise.enabled=false;}}
+    }
+    fn clock_sweep(&mut self) {
+        let period=(self.sq1.nr0>>4)&7; let shift=self.sq1.nr0&7;
+        if period==0{return;}
+        if self.sq1.sweep_timer>0{self.sq1.sweep_timer-=1;}
+        if self.sq1.sweep_timer==0{
+            self.sq1.sweep_timer=if period!=0{period}else{8};
+            if shift!=0&&self.sq1.sweep_enabled{
+                let freq=self.sq1.sweep_shadow; let delta=freq>>shift;
+                let nf=if self.sq1.nr0&8!=0{freq.wrapping_sub(delta)}else{freq+delta};
+                if nf<=2047{self.sq1.sweep_shadow=nf;self.sq1.nr4=(self.sq1.nr4&0xF8)|((nf>>8)as u8&7);self.sq1.nr3=(nf&0xFF)as u8;}
+                else{self.sq1.enabled=false;}
+            }
+        }
+    }
+    fn clock_env(&mut self) {
+        fn tick(v:&mut u8,t:&mut u8,nr2:u8){if *t>0{*t-=1;}if *t==0{let p=nr2&7;*t=if p!=0{p}else{8};if nr2&8!=0{if *v<15{*v+=1;}}else{if *v>0{*v-=1;}}}}
+        tick(&mut self.sq1.volume,&mut self.sq1.env_timer,self.sq1.nr2);
+        tick(&mut self.sq2.volume,&mut self.sq2.env_timer,self.sq2.nr2);
+        tick(&mut self.noise.volume,&mut self.noise.env_timer,self.noise.nr2);
     }
 }
 
@@ -851,7 +887,7 @@ impl Bus {
         if self.ppu.stat_irq   { self.if_reg |= 0x02; }
         self.timer.step(cycles);
         if self.timer.overflow_irq { self.if_reg |= 0x04; }
-        self.apu.step(cycles);
+        self.apu.step_with_fs(cycles);
     }
 }
 
@@ -910,6 +946,432 @@ fn decode(op: u8, bus: &Bus, pc: u16) -> (u8, i16) {
     }
 }
 
+
+// ── SM83 full instruction set (Phase 5) ──────────────────────────────────────
+// Called from GbCore::step() in the match op { ... } block.
+// Returns cycle count (u8). PC has already been advanced by delta from decode().
+
+fn exec_op(op: u8, regs: &mut Registers, bus: &mut Bus, default_cyc: u8) -> u8 {
+    // Helper: read immediate byte after opcode
+    macro_rules! imm8 {
+        () => {{ let v = bus.read(regs.pc.wrapping_sub(1)); v }}
+    }
+    // We need the PC *before* decode advanced it. Caller passes pre-exec pc.
+    // Instead, use the decode-table delta. Easier: regs.pc was already advanced,
+    // so imm8 is at pc-1 (1-byte imm after 1-byte opcode), imm16 lo at pc-2, hi at pc-1.
+
+    let cyc = default_cyc;
+
+    // Read immediates from pre-instruction positions
+    // After decode() advanced pc, pc points PAST the instruction.
+    // For a 2-byte instr (opcode + imm8): imm8 = bus.read(pc - 1)
+    // For a 3-byte instr (opcode + imm16): lo = bus.read(pc - 2), hi = bus.read(pc - 1)
+    let pre_pc = regs.pc;   // PC *after* delta advance (next instr)
+
+    // Macros using pre-calc offsets
+    let imm8_val: u8 = bus.read(pre_pc.wrapping_sub(1));
+    let imm16_val: u16 = {
+        let lo = bus.read(pre_pc.wrapping_sub(2)) as u16;
+        let hi = bus.read(pre_pc.wrapping_sub(1)) as u16;
+        (hi << 8) | lo
+    };
+
+    // ── Helper closures ──────────────────────────────────────────────────────
+    // ADD A, r
+    let add_a = |regs: &mut Registers, val: u8| {
+        let a = regs.a; let r = a.wrapping_add(val);
+        regs.set_flag_z(r == 0); regs.set_flag_n(false);
+        regs.set_flag_h((a & 0x0F) + (val & 0x0F) > 0x0F);
+        regs.set_flag_c(a as u16 + val as u16 > 0xFF); regs.a = r;
+    };
+    let adc_a = |regs: &mut Registers, val: u8| {
+        let a = regs.a; let c = if regs.flag_c() { 1u8 } else { 0 };
+        let r = a.wrapping_add(val).wrapping_add(c);
+        regs.set_flag_z(r == 0); regs.set_flag_n(false);
+        regs.set_flag_h((a & 0x0F) + (val & 0x0F) + c > 0x0F);
+        regs.set_flag_c(a as u16 + val as u16 + c as u16 > 0xFF); regs.a = r;
+    };
+    let sub_a = |regs: &mut Registers, val: u8| {
+        let a = regs.a; let r = a.wrapping_sub(val);
+        regs.set_flag_z(r == 0); regs.set_flag_n(true);
+        regs.set_flag_h((a & 0x0F) < (val & 0x0F));
+        regs.set_flag_c(a < val); regs.a = r;
+    };
+    let sbc_a = |regs: &mut Registers, val: u8| {
+        let a = regs.a; let c = if regs.flag_c() { 1u8 } else { 0 };
+        let r = a.wrapping_sub(val).wrapping_sub(c);
+        regs.set_flag_z(r == 0); regs.set_flag_n(true);
+        regs.set_flag_h((a & 0x0F) < (val & 0x0F) + c);
+        regs.set_flag_c((a as u16) < (val as u16 + c as u16)); regs.a = r;
+    };
+    let and_a = |regs: &mut Registers, val: u8| {
+        regs.a &= val;
+        regs.set_flag_z(regs.a == 0); regs.set_flag_n(false);
+        regs.set_flag_h(true); regs.set_flag_c(false);
+    };
+    let xor_a = |regs: &mut Registers, val: u8| {
+        regs.a ^= val;
+        regs.set_flag_z(regs.a == 0); regs.set_flag_n(false);
+        regs.set_flag_h(false); regs.set_flag_c(false);
+    };
+    let or_a = |regs: &mut Registers, val: u8| {
+        regs.a |= val;
+        regs.set_flag_z(regs.a == 0); regs.set_flag_n(false);
+        regs.set_flag_h(false); regs.set_flag_c(false);
+    };
+    let cp_a = |regs: &mut Registers, val: u8| {
+        let a = regs.a;
+        regs.set_flag_z(a == val); regs.set_flag_n(true);
+        regs.set_flag_h((a & 0x0F) < (val & 0x0F));
+        regs.set_flag_c(a < val);
+    };
+    let inc8 = |regs: &mut Registers, val: u8| -> u8 {
+        let r = val.wrapping_add(1);
+        regs.set_flag_z(r == 0); regs.set_flag_n(false);
+        regs.set_flag_h((val & 0x0F) == 0x0F); r
+    };
+    let dec8 = |regs: &mut Registers, val: u8| -> u8 {
+        let r = val.wrapping_sub(1);
+        regs.set_flag_z(r == 0); regs.set_flag_n(true);
+        regs.set_flag_h((val & 0x0F) == 0x00); r
+    };
+    let add_hl = |regs: &mut Registers, val: u16| {
+        let hl = regs.hl(); let r = hl.wrapping_add(val);
+        regs.set_flag_n(false);
+        regs.set_flag_h((hl & 0x0FFF) + (val & 0x0FFF) > 0x0FFF);
+        regs.set_flag_c(hl as u32 + val as u32 > 0xFFFF);
+        regs.set_hl(r);
+    };
+
+    match op {
+        // ── NOP ────────────────────────────────────────────────────────────
+        0x00 => {}
+
+        // ── LD r16, d16 ────────────────────────────────────────────────────
+        0x01 => regs.set_bc(imm16_val),
+        0x11 => regs.set_de(imm16_val),
+        0x21 => regs.set_hl(imm16_val),
+        0x31 => regs.sp = imm16_val,
+
+        // ── LD (r16), A / LD A, (r16) ──────────────────────────────────────
+        0x02 => bus.write(regs.bc(), regs.a),
+        0x12 => bus.write(regs.de(), regs.a),
+        0x0A => regs.a = bus.read(regs.bc()),
+        0x1A => regs.a = bus.read(regs.de()),
+
+        // ── INC/DEC r16 ────────────────────────────────────────────────────
+        0x03 => regs.set_bc(regs.bc().wrapping_add(1)),
+        0x13 => regs.set_de(regs.de().wrapping_add(1)),
+        0x23 => regs.set_hl(regs.hl().wrapping_add(1)),
+        0x33 => regs.sp = regs.sp.wrapping_add(1),
+        0x0B => regs.set_bc(regs.bc().wrapping_sub(1)),
+        0x1B => regs.set_de(regs.de().wrapping_sub(1)),
+        0x2B => regs.set_hl(regs.hl().wrapping_sub(1)),
+        0x3B => regs.sp = regs.sp.wrapping_sub(1),
+
+        // ── INC r8 ─────────────────────────────────────────────────────────
+        0x04 => { let v=inc8(regs,regs.b); regs.b=v; }
+        0x0C => { let v=inc8(regs,regs.c); regs.c=v; }
+        0x14 => { let v=inc8(regs,regs.d); regs.d=v; }
+        0x1C => { let v=inc8(regs,regs.e); regs.e=v; }
+        0x24 => { let v=inc8(regs,regs.h); regs.h=v; }
+        0x2C => { let v=inc8(regs,regs.l); regs.l=v; }
+        0x34 => { let a=regs.hl(); let v=inc8(regs,bus.read(a)); bus.write(a,v); }
+        0x3C => { let v=inc8(regs,regs.a); regs.a=v; }
+
+        // ── DEC r8 ─────────────────────────────────────────────────────────
+        0x05 => { let v=dec8(regs,regs.b); regs.b=v; }
+        0x0D => { let v=dec8(regs,regs.c); regs.c=v; }
+        0x15 => { let v=dec8(regs,regs.d); regs.d=v; }
+        0x1D => { let v=dec8(regs,regs.e); regs.e=v; }
+        0x25 => { let v=dec8(regs,regs.h); regs.h=v; }
+        0x2D => { let v=dec8(regs,regs.l); regs.l=v; }
+        0x35 => { let a=regs.hl(); let v=dec8(regs,bus.read(a)); bus.write(a,v); }
+        0x3D => { let v=dec8(regs,regs.a); regs.a=v; }
+
+        // ── LD r8, d8 ──────────────────────────────────────────────────────
+        0x06 => regs.b = imm8_val,
+        0x0E => regs.c = imm8_val,
+        0x16 => regs.d = imm8_val,
+        0x1E => regs.e = imm8_val,
+        0x26 => regs.h = imm8_val,
+        0x2E => regs.l = imm8_val,
+        0x36 => { let a=regs.hl(); bus.write(a, imm8_val); }
+        0x3E => regs.a = imm8_val,
+
+        // ── RLCA / RRCA / RLA / RRA ────────────────────────────────────────
+        0x07 => { let c=regs.a>>7; regs.a=(regs.a<<1)|c; regs.f=if c!=0{0x10}else{0}; }
+        0x0F => { let c=regs.a&1; regs.a=(regs.a>>1)|(c<<7); regs.f=if c!=0{0x10}else{0}; }
+        0x17 => { let oc=if regs.flag_c(){1}else{0}; let nc=regs.a>>7; regs.a=(regs.a<<1)|oc; regs.f=if nc!=0{0x10}else{0}; }
+        0x1F => { let oc=if regs.flag_c(){0x80}else{0}; let nc=regs.a&1; regs.a=(regs.a>>1)|oc; regs.f=if nc!=0{0x10}else{0}; }
+
+        // ── LD (a16), SP ───────────────────────────────────────────────────
+        0x08 => { let a=imm16_val; bus.write(a,regs.sp as u8); bus.write(a.wrapping_add(1),(regs.sp>>8) as u8); }
+
+        // ── ADD HL, r16 ────────────────────────────────────────────────────
+        0x09 => { let v=regs.bc(); add_hl(regs,v); }
+        0x19 => { let v=regs.de(); add_hl(regs,v); }
+        0x29 => { let v=regs.hl(); add_hl(regs,v); }
+        0x39 => { let v=regs.sp; add_hl(regs,v); }
+
+        // ── JR e8 (always) ─────────────────────────────────────────────────
+        0x18 => { /* PC already advanced; imm was signed offset after opcode */
+            let e = imm8_val as i8 as i16;
+            regs.pc = regs.pc.wrapping_add_signed(e);
+        }
+
+        // ── JR cc, e8 ──────────────────────────────────────────────────────
+        // decode gave cyc=8 (not-taken); taken = 12 (handled by returning 12)
+        0x20 => { if !regs.flag_z() { let e=imm8_val as i8 as i16; regs.pc=regs.pc.wrapping_add_signed(e); return 12; } }
+        0x28 => { if  regs.flag_z() { let e=imm8_val as i8 as i16; regs.pc=regs.pc.wrapping_add_signed(e); return 12; } }
+        0x30 => { if !regs.flag_c() { let e=imm8_val as i8 as i16; regs.pc=regs.pc.wrapping_add_signed(e); return 12; } }
+        0x38 => { if  regs.flag_c() { let e=imm8_val as i8 as i16; regs.pc=regs.pc.wrapping_add_signed(e); return 12; } }
+
+        // ── LDI / LDD (HL+/-), A and A, (HL+/-) ──────────────────────────
+        0x22 => { bus.write(regs.hl(), regs.a); regs.set_hl(regs.hl().wrapping_add(1)); }
+        0x2A => { regs.a = bus.read(regs.hl()); regs.set_hl(regs.hl().wrapping_add(1)); }
+        0x32 => { bus.write(regs.hl(), regs.a); regs.set_hl(regs.hl().wrapping_sub(1)); }
+        0x3A => { regs.a = bus.read(regs.hl()); regs.set_hl(regs.hl().wrapping_sub(1)); }
+
+        // ── DAA ────────────────────────────────────────────────────────────
+        0x27 => {
+            let mut a = regs.a; let mut adj: u8 = 0;
+            let n = regs.flag_n(); let h = regs.flag_h(); let c = regs.flag_c();
+            if !n {
+                if h || (a & 0x0F) > 9  { adj |= 0x06; }
+                if c || a > 0x99         { adj |= 0x60; }
+                a = a.wrapping_add(adj);
+            } else {
+                if h { adj |= 0x06; }
+                if c { adj |= 0x60; }
+                a = a.wrapping_sub(adj);
+            }
+            regs.set_flag_z(a == 0); regs.set_flag_h(false);
+            if adj & 0x60 != 0 { regs.set_flag_c(true); }
+            regs.a = a;
+        }
+
+        // ── CPL / SCF / CCF ────────────────────────────────────────────────
+        0x2F => { regs.a = !regs.a; regs.set_flag_n(true); regs.set_flag_h(true); }
+        0x37 => { regs.set_flag_n(false); regs.set_flag_h(false); regs.set_flag_c(true); }
+        0x3F => { let c=regs.flag_c(); regs.set_flag_n(false); regs.set_flag_h(false); regs.set_flag_c(!c); }
+
+        // ── HALT ───────────────────────────────────────────────────────────
+        0x76 => {} // handled by caller
+
+        // ── LD r8, r8 (full 8x8 grid 0x40-0x7F minus 0x76) ───────────────
+        0x40 => {} // LD B,B  (nop)
+        0x41 => regs.b = regs.c,
+        0x42 => regs.b = regs.d,
+        0x43 => regs.b = regs.e,
+        0x44 => regs.b = regs.h,
+        0x45 => regs.b = regs.l,
+        0x46 => regs.b = bus.read(regs.hl()),
+        0x47 => regs.b = regs.a,
+        0x48 => regs.c = regs.b,
+        0x49 => {} // LD C,C
+        0x4A => regs.c = regs.d,
+        0x4B => regs.c = regs.e,
+        0x4C => regs.c = regs.h,
+        0x4D => regs.c = regs.l,
+        0x4E => regs.c = bus.read(regs.hl()),
+        0x4F => regs.c = regs.a,
+        0x50 => regs.d = regs.b,
+        0x51 => regs.d = regs.c,
+        0x52 => {} // LD D,D
+        0x53 => regs.d = regs.e,
+        0x54 => regs.d = regs.h,
+        0x55 => regs.d = regs.l,
+        0x56 => regs.d = bus.read(regs.hl()),
+        0x57 => regs.d = regs.a,
+        0x58 => regs.e = regs.b,
+        0x59 => regs.e = regs.c,
+        0x5A => regs.e = regs.d,
+        0x5B => {} // LD E,E
+        0x5C => regs.e = regs.h,
+        0x5D => regs.e = regs.l,
+        0x5E => regs.e = bus.read(regs.hl()),
+        0x5F => regs.e = regs.a,
+        0x60 => regs.h = regs.b,
+        0x61 => regs.h = regs.c,
+        0x62 => regs.h = regs.d,
+        0x63 => regs.h = regs.e,
+        0x64 => {} // LD H,H
+        0x65 => regs.h = regs.l,
+        0x66 => regs.h = bus.read(regs.hl()),
+        0x67 => regs.h = regs.a,
+        0x68 => regs.l = regs.b,
+        0x69 => regs.l = regs.c,
+        0x6A => regs.l = regs.d,
+        0x6B => regs.l = regs.e,
+        0x6C => regs.l = regs.h,
+        0x6D => {} // LD L,L
+        0x6E => regs.l = bus.read(regs.hl()),
+        0x6F => regs.l = regs.a,
+        0x70 => bus.write(regs.hl(), regs.b),
+        0x71 => bus.write(regs.hl(), regs.c),
+        0x72 => bus.write(regs.hl(), regs.d),
+        0x73 => bus.write(regs.hl(), regs.e),
+        0x74 => bus.write(regs.hl(), regs.h),
+        0x75 => bus.write(regs.hl(), regs.l),
+        0x77 => bus.write(regs.hl(), regs.a),
+        0x78 => regs.a = regs.b,
+        0x79 => regs.a = regs.c,
+        0x7A => regs.a = regs.d,
+        0x7B => regs.a = regs.e,
+        0x7C => regs.a = regs.h,
+        0x7D => regs.a = regs.l,
+        0x7E => regs.a = bus.read(regs.hl()),
+        0x7F => {} // LD A,A
+
+        // ── ALU A, r8 ──────────────────────────────────────────────────────
+        0x80=>{let v=regs.b; add_a(regs,v);} 0x81=>{let v=regs.c; add_a(regs,v);}
+        0x82=>{let v=regs.d; add_a(regs,v);} 0x83=>{let v=regs.e; add_a(regs,v);}
+        0x84=>{let v=regs.h; add_a(regs,v);} 0x85=>{let v=regs.l; add_a(regs,v);}
+        0x86=>{let v=bus.read(regs.hl()); add_a(regs,v);}
+        0x87=>{let v=regs.a; add_a(regs,v);}
+        0x88=>{let v=regs.b; adc_a(regs,v);} 0x89=>{let v=regs.c; adc_a(regs,v);}
+        0x8A=>{let v=regs.d; adc_a(regs,v);} 0x8B=>{let v=regs.e; adc_a(regs,v);}
+        0x8C=>{let v=regs.h; adc_a(regs,v);} 0x8D=>{let v=regs.l; adc_a(regs,v);}
+        0x8E=>{let v=bus.read(regs.hl()); adc_a(regs,v);}
+        0x8F=>{let v=regs.a; adc_a(regs,v);}
+        0x90=>{let v=regs.b; sub_a(regs,v);} 0x91=>{let v=regs.c; sub_a(regs,v);}
+        0x92=>{let v=regs.d; sub_a(regs,v);} 0x93=>{let v=regs.e; sub_a(regs,v);}
+        0x94=>{let v=regs.h; sub_a(regs,v);} 0x95=>{let v=regs.l; sub_a(regs,v);}
+        0x96=>{let v=bus.read(regs.hl()); sub_a(regs,v);}
+        0x97=>{let v=regs.a; sub_a(regs,v);}
+        0x98=>{let v=regs.b; sbc_a(regs,v);} 0x99=>{let v=regs.c; sbc_a(regs,v);}
+        0x9A=>{let v=regs.d; sbc_a(regs,v);} 0x9B=>{let v=regs.e; sbc_a(regs,v);}
+        0x9C=>{let v=regs.h; sbc_a(regs,v);} 0x9D=>{let v=regs.l; sbc_a(regs,v);}
+        0x9E=>{let v=bus.read(regs.hl()); sbc_a(regs,v);}
+        0x9F=>{let v=regs.a; sbc_a(regs,v);}
+        0xA0=>{let v=regs.b; and_a(regs,v);} 0xA1=>{let v=regs.c; and_a(regs,v);}
+        0xA2=>{let v=regs.d; and_a(regs,v);} 0xA3=>{let v=regs.e; and_a(regs,v);}
+        0xA4=>{let v=regs.h; and_a(regs,v);} 0xA5=>{let v=regs.l; and_a(regs,v);}
+        0xA6=>{let v=bus.read(regs.hl()); and_a(regs,v);}
+        0xA7=>{let v=regs.a; and_a(regs,v);}
+        0xA8=>{let v=regs.b; xor_a(regs,v);} 0xA9=>{let v=regs.c; xor_a(regs,v);}
+        0xAA=>{let v=regs.d; xor_a(regs,v);} 0xAB=>{let v=regs.e; xor_a(regs,v);}
+        0xAC=>{let v=regs.h; xor_a(regs,v);} 0xAD=>{let v=regs.l; xor_a(regs,v);}
+        0xAE=>{let v=bus.read(regs.hl()); xor_a(regs,v);}
+        0xAF=>{let v=regs.a; xor_a(regs,v);}
+        0xB0=>{let v=regs.b; or_a(regs,v);} 0xB1=>{let v=regs.c; or_a(regs,v);}
+        0xB2=>{let v=regs.d; or_a(regs,v);} 0xB3=>{let v=regs.e; or_a(regs,v);}
+        0xB4=>{let v=regs.h; or_a(regs,v);} 0xB5=>{let v=regs.l; or_a(regs,v);}
+        0xB6=>{let v=bus.read(regs.hl()); or_a(regs,v);}
+        0xB7=>{let v=regs.a; or_a(regs,v);}
+        0xB8=>{let v=regs.b; cp_a(regs,v);} 0xB9=>{let v=regs.c; cp_a(regs,v);}
+        0xBA=>{let v=regs.d; cp_a(regs,v);} 0xBB=>{let v=regs.e; cp_a(regs,v);}
+        0xBC=>{let v=regs.h; cp_a(regs,v);} 0xBD=>{let v=regs.l; cp_a(regs,v);}
+        0xBE=>{let v=bus.read(regs.hl()); cp_a(regs,v);}
+        0xBF=>{let v=regs.a; cp_a(regs,v);}
+
+        // ── ALU A, d8 ──────────────────────────────────────────────────────
+        0xC6 => add_a(regs, imm8_val),
+        0xCE => adc_a(regs, imm8_val),
+        0xD6 => sub_a(regs, imm8_val),
+        0xDE => sbc_a(regs, imm8_val),
+        0xE6 => and_a(regs, imm8_val),
+        0xEE => xor_a(regs, imm8_val),
+        0xF6 => or_a(regs, imm8_val),
+        0xFE => cp_a(regs, imm8_val),
+
+        // ── RET cc ─────────────────────────────────────────────────────────
+        0xC0 => { if !regs.flag_z() { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.pc=(hi<<8)|lo; return 20; } }
+        0xC8 => { if  regs.flag_z() { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.pc=(hi<<8)|lo; return 20; } }
+        0xD0 => { if !regs.flag_c() { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.pc=(hi<<8)|lo; return 20; } }
+        0xD8 => { if  regs.flag_c() { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.pc=(hi<<8)|lo; return 20; } }
+
+        // ── POP r16 ────────────────────────────────────────────────────────
+        0xC1 => { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.set_bc((hi<<8)|lo); }
+        0xD1 => { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.set_de((hi<<8)|lo); }
+        0xE1 => { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.set_hl((hi<<8)|lo); }
+        0xF1 => { let lo=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); let hi=bus.read(regs.sp) as u16; regs.sp=regs.sp.wrapping_add(1); regs.set_af((hi<<8)|(lo&0xF0)); }
+
+        // ── JP cc, a16 ─────────────────────────────────────────────────────
+        0xC2 => { if !regs.flag_z() { regs.pc=imm16_val; return 16; } }
+        0xCA => { if  regs.flag_z() { regs.pc=imm16_val; return 16; } }
+        0xD2 => { if !regs.flag_c() { regs.pc=imm16_val; return 16; } }
+        0xDA => { if  regs.flag_c() { regs.pc=imm16_val; return 16; } }
+
+        // ── JP a16 / JP HL already handled in caller ───────────────────────
+        0xC3 | 0xE9 => {} // handled by step()
+        0xCD | 0xC9 | 0xD9 => {} // CALL/RET handled by step()
+
+        // ── PUSH r16 ───────────────────────────────────────────────────────
+        0xC5 => { let v=regs.bc(); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,(v>>8)as u8); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,v as u8); }
+        0xD5 => { let v=regs.de(); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,(v>>8)as u8); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,v as u8); }
+        0xE5 => { let v=regs.hl(); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,(v>>8)as u8); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,v as u8); }
+        0xF5 => { let v=regs.af(); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,(v>>8)as u8); regs.sp=regs.sp.wrapping_sub(1); bus.write(regs.sp,(v&0xF0) as u8); }
+
+        // ── CALL cc, a16 ───────────────────────────────────────────────────
+        0xC4 => { if !regs.flag_z() { push_call(regs,bus,imm16_val); return 24; } }
+        0xCC => { if  regs.flag_z() { push_call(regs,bus,imm16_val); return 24; } }
+        0xD4 => { if !regs.flag_c() { push_call(regs,bus,imm16_val); return 24; } }
+        0xDC => { if  regs.flag_c() { push_call(regs,bus,imm16_val); return 24; } }
+
+        // ── RST nn ─────────────────────────────────────────────────────────
+        0xC7 => push_call(regs,bus,0x0000), 0xCF => push_call(regs,bus,0x0008),
+        0xD7 => push_call(regs,bus,0x0010), 0xDF => push_call(regs,bus,0x0018),
+        0xE7 => push_call(regs,bus,0x0020), 0xEF => push_call(regs,bus,0x0028),
+        0xF7 => push_call(regs,bus,0x0030), 0xFF => push_call(regs,bus,0x0038),
+
+        // ── LDH (a8), A / LDH A, (a8) ─────────────────────────────────────
+        0xE0 => bus.write(0xFF00 | imm8_val as u16, regs.a),
+        0xF0 => regs.a = bus.read(0xFF00 | imm8_val as u16),
+
+        // ── LD (C), A / LD A, (C) ──────────────────────────────────────────
+        0xE2 => bus.write(0xFF00 | regs.c as u16, regs.a),
+        0xF2 => regs.a = bus.read(0xFF00 | regs.c as u16),
+
+        // ── ADD SP, e8 ─────────────────────────────────────────────────────
+        0xE8 => {
+            let e = imm8_val as i8 as i32; let sp = regs.sp as i32;
+            let r = sp.wrapping_add(e) as u16;
+            regs.set_flag_z(false); regs.set_flag_n(false);
+            regs.set_flag_h(((sp ^ e ^ r as i32) & 0x10) != 0);
+            regs.set_flag_c(((sp ^ e ^ r as i32) & 0x100) != 0);
+            regs.sp = r;
+        }
+
+        // ── LD (a16), A / LD A, (a16) ──────────────────────────────────────
+        0xEA => bus.write(imm16_val, regs.a),
+        0xFA => regs.a = bus.read(imm16_val),
+
+        // ── LD HL, SP+e8 ───────────────────────────────────────────────────
+        0xF8 => {
+            let e = imm8_val as i8 as i32; let sp = regs.sp as i32;
+            let r = sp.wrapping_add(e) as u16;
+            regs.set_flag_z(false); regs.set_flag_n(false);
+            regs.set_flag_h(((sp ^ e ^ r as i32) & 0x10) != 0);
+            regs.set_flag_c(((sp ^ e ^ r as i32) & 0x100) != 0);
+            regs.set_hl(r);
+        }
+
+        // ── LD SP, HL ──────────────────────────────────────────────────────
+        0xF9 => regs.sp = regs.hl(),
+
+        // ── DI / EI handled in caller ──────────────────────────────────────
+        0xF3 | 0xFB => {}
+
+        // ── CB prefix handled in caller ────────────────────────────────────
+        0xCB => {}
+
+        // ── Illegal / unused ───────────────────────────────────────────────
+        _ => {}
+    }
+    cyc
+}
+
+// Push PC (already past instruction) and jump — used by CALL and conditional CALL
+#[inline(always)]
+fn push_call(regs: &mut Registers, bus: &mut Bus, target: u16) {
+    regs.sp = regs.sp.wrapping_sub(1); bus.write(regs.sp, (regs.pc >> 8) as u8);
+    regs.sp = regs.sp.wrapping_sub(1); bus.write(regs.sp, regs.pc as u8);
+    regs.pc = target;
+}
+
+
 // ── GbCore ────────────────────────────────────────────────────────────────────
 pub struct GbCore {
     pub regs: Registers, pub bus: Bus, pub clock: Clock,
@@ -946,32 +1408,23 @@ impl GbCore {
             }
         }
         let op = self.bus.read(self.regs.pc);
+        // Phase 5: full SM83 instruction set via exec_op
         let cycles = if op == 0xCB {
             exec_cb(&mut self.regs, &mut self.bus)
         } else {
+            // Decode: get cycle count + PC delta, advance PC
             let (cyc, delta) = decode(op, &self.bus, self.regs.pc);
+            self.regs.pc = self.regs.pc.wrapping_add(delta as u16);
+            // Execute instruction (exec_op reads immediates relative to advanced PC)
+            let actual_cyc = exec_op(op, &mut self.regs, &mut self.bus, cyc as u8);
+            // Handle ops that exec_op defers back to step()
             match op {
-                0xC3 => { let lo=self.bus.read(self.regs.pc.wrapping_add(1)) as u16; let hi=self.bus.read(self.regs.pc.wrapping_add(2)) as u16; self.regs.pc=(hi<<8)|lo; }
-                0xE9 => { self.regs.pc = self.regs.hl(); }
-                0xCD => {
-                    let lo=self.bus.read(self.regs.pc.wrapping_add(1)) as u16;
-                    let hi=self.bus.read(self.regs.pc.wrapping_add(2)) as u16;
-                    let ret=self.regs.pc.wrapping_add(3);
-                    self.regs.sp=self.regs.sp.wrapping_sub(1); self.bus.write(self.regs.sp,(ret>>8)as u8);
-                    self.regs.sp=self.regs.sp.wrapping_sub(1); self.bus.write(self.regs.sp,ret as u8);
-                    self.regs.pc=(hi<<8)|lo;
-                }
-                0xC9|0xD9 => {
-                    let lo=self.bus.read(self.regs.sp) as u16; self.regs.sp=self.regs.sp.wrapping_add(1);
-                    let hi=self.bus.read(self.regs.sp) as u16; self.regs.sp=self.regs.sp.wrapping_add(1);
-                    self.regs.pc=(hi<<8)|lo; if op==0xD9 { self.ime=true; }
-                }
-                0x76 => { self.halted=true; self.regs.pc=self.regs.pc.wrapping_add(1); }
-                0xF3 => { self.ime=false; self.regs.pc=self.regs.pc.wrapping_add(delta as u16); }
-                0xFB => { self.ime_pending=true; self.regs.pc=self.regs.pc.wrapping_add(delta as u16); }
-                _ => { self.regs.pc=self.regs.pc.wrapping_add(delta as u16); }
+                0x76 => { self.regs.pc = self.regs.pc.wrapping_sub(delta as u16); self.halted = true; }
+                0xF3 => { self.ime = false; }
+                0xFB => { self.ime_pending = true; }
+                _ => {}
             }
-            cyc
+            actual_cyc
         };
         self.bus.step_subsystems(cycles);
         self.clock.tick(cycles);
