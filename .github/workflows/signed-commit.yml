@@ -1,0 +1,49 @@
+name: Signed File Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_path:
+        description: 'Target file path in repo (e.g. hyperloop_state.json)'
+        required: true
+        type: string
+      content_b64:
+        description: 'Base64-encoded file content'
+        required: true
+        type: string
+      commit_message:
+        description: 'Commit message'
+        required: true
+        default: 'chore: update file via signed commit workflow'
+        type: string
+      branch:
+        description: 'Target branch'
+        required: false
+        default: 'main'
+        type: string
+
+jobs:
+  commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write file
+        run: |
+          mkdir -p "$(dirname '${{ github.event.inputs.file_path }}')"
+          echo '${{ github.event.inputs.content_b64 }}' | base64 -d > '${{ github.event.inputs.file_path }}'
+
+      - name: Commit and push
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add '${{ github.event.inputs.file_path }}'
+          git diff --cached --quiet || git commit -m '${{ github.event.inputs.commit_message }}'
+          git push origin '${{ github.event.inputs.branch }}'
