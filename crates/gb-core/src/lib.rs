@@ -303,20 +303,27 @@ impl Timer {
 // ── Bus ───────────────────────────────────────────────────────────────────────
 pub struct Bus {
     pub rom: Vec<u8>, pub ram: Vec<u8>,
-    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8, pub wram: [u8; 0x2000],
+    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8,
+    pub wram: [[u8; 0x1000]; 8], pub wram_bank: u8,
     pub hram: [u8; 0x7F], pub oam: [u8; 0xA0],
     pub io: [u8; 0x80], pub ie: u8, pub if_reg: u8,
     pub mbc: Mbc, pub ppu: Ppu, pub apu: Apu, pub timer: Timer,
     pub joypad: u8,
     pub double_speed: bool, pub speed_switch_armed: bool,
+    // CGB color palettes: [palette_idx][color_idx*2 | byte_offset] = 64 bytes each
+    pub bg_cpal:  [u8; 64], pub bg_cps:  u8,  // BCPS index register
+    pub obj_cpal: [u8; 64], pub obj_cps: u8,  // OCPS index register
 }
 impl Bus {
     pub fn new(cart: Cartridge) -> Self {
         let mbc = Mbc::new(cart.kind.clone());
-        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0, wram: [0u8;0x2000],
+        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0,
+              wram: [[0u8;0x1000]; 8], wram_bank: 1,
               hram: [0u8;0x7F], oam: [0u8;0xA0], io: [0u8;0x80], ie: 0, if_reg: 0,
               mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF,
-              double_speed: false, speed_switch_armed: false }
+              double_speed: false, speed_switch_armed: false,
+              bg_cpal: [0xFFu8; 64], bg_cps: 0,
+              obj_cpal: [0u8; 64],   obj_cps: 0 }
     }
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
@@ -332,8 +339,10 @@ impl Bus {
                     }
                 } else { 0xFF }
             }
-            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize],
-            0xE000..=0xFDFF => self.wram[(addr-0xE000) as usize],
+            0xC000..=0xCFFF => self.wram[0][(addr-0xC000) as usize],
+            0xD000..=0xDFFF => self.wram[self.wram_bank as usize][(addr-0xD000) as usize],
+            0xE000..=0xEFFF => self.wram[0][(addr-0xE000) as usize],
+            0xF000..=0xFDFF => self.wram[self.wram_bank as usize][(addr-0xF000) as usize],
             0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize],
             0xFF00 => self.joypad,
             0xFF01..=0xFF03 => self.io[(addr-0xFF00) as usize],
@@ -344,6 +353,11 @@ impl Bus {
             0xFF46 => 0xFF,
             0xFF4D => (if self.double_speed {0x80} else {0}) | (if self.speed_switch_armed {0x01} else {0}),
             0xFF4F => 0xFE | self.vram_bank,
+            0xFF68 => self.bg_cps,
+            0xFF69 => self.bg_cpal[(self.bg_cps & 0x3F) as usize],
+            0xFF6A => self.obj_cps,
+            0xFF6B => self.obj_cpal[(self.obj_cps & 0x3F) as usize],
+            0xFF70 => 0xF8 | self.wram_bank,
             0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize],
             0xFFFF => self.ie,
             _ => 0xFF,
@@ -363,7 +377,8 @@ impl Bus {
                     }
                 }
             }
-            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize] = val,
+            0xC000..=0xCFFF => self.wram[0][(addr-0xC000) as usize] = val,
+            0xD000..=0xDFFF => self.wram[self.wram_bank as usize][(addr-0xD000) as usize] = val,
             0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize] = val,
             0xFF00 => self.joypad = val,
             0xFF04..=0xFF07 => self.timer.write((addr-0xFF00) as u8, val),
@@ -372,12 +387,60 @@ impl Bus {
             0xFF40..=0xFF45 | 0xFF47..=0xFF4B => self.ppu.write_reg((addr-0xFF00) as u8, val),
             0xFF4D => self.speed_switch_armed = val & 0x01 != 0,
             0xFF4F => self.vram_bank = val & 0x01,
+            0xFF68 => self.bg_cps = val & 0xBF,  // bit 6 reserved
+            0xFF69 => {
+                let idx = (self.bg_cps & 0x3F) as usize;
+                self.bg_cpal[idx] = val;
+                if self.bg_cps & 0x80 != 0 { self.bg_cps = (self.bg_cps & 0x80) | ((idx as u8 + 1) & 0x3F); }
+            }
+            0xFF6A => self.obj_cps = val & 0xBF,
+            0xFF6B => {
+                let idx = (self.obj_cps & 0x3F) as usize;
+                self.obj_cpal[idx] = val;
+                if self.obj_cps & 0x80 != 0 { self.obj_cps = (self.obj_cps & 0x80) | ((idx as u8 + 1) & 0x3F); }
+            }
+            0xFF70 => self.wram_bank = if val & 0x07 == 0 { 1 } else { val & 0x07 },
             0xFF46 => { let src=(val as u16)<<8; for i in 0..0xA0u16 { let b=self.read(src+i); self.oam[i as usize]=b; } }
             0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize] = val,
             0xFFFF => self.ie = val,
             _ => {}
         }
     }
+
+    /// Decode a CGB palette entry (2-byte little-endian RGB555) to (r8,g8,b8)
+    pub fn cgb_color(cpal: &[u8; 64], palette: u8, color: u8) -> (u8, u8, u8) {
+        let idx = (palette as usize) * 8 + (color as usize) * 2;
+        let lo = cpal[idx] as u16;
+        let hi = cpal[idx + 1] as u16;
+        let rgb = lo | (hi << 8);
+        let r = ((rgb & 0x001F) as u8) << 3;
+        let g = (((rgb >> 5) & 0x001F) as u8) << 3;
+        let b = (((rgb >> 10) & 0x001F) as u8) << 3;
+        (r, g, b)
+    }
+
+    /// Get full BG color palette as RGB888 array [palette][color] = (r,g,b)
+    pub fn bg_palette_rgb(&self) -> [[(u8,u8,u8); 4]; 8] {
+        let mut out = [[(0u8,0u8,0u8); 4]; 8];
+        for p in 0..8 {
+            for c in 0..4 {
+                out[p][c] = Self::cgb_color(&self.bg_cpal, p as u8, c as u8);
+            }
+        }
+        out
+    }
+
+    /// Get full OBJ color palette as RGB888 array [palette][color] = (r,g,b)
+    pub fn obj_palette_rgb(&self) -> [[(u8,u8,u8); 4]; 8] {
+        let mut out = [[(0u8,0u8,0u8); 4]; 8];
+        for p in 0..8 {
+            for c in 0..4 {
+                out[p][c] = Self::cgb_color(&self.obj_cpal, p as u8, c as u8);
+            }
+        }
+        out
+    }
+
     pub fn step_subsystems(&mut self, cycles: u8) {
         // In double-speed mode CPU runs 2x; PPU/APU/Timer stay at 1x speed
         let sub_cycles = if self.double_speed { (cycles + 1) / 2 } else { cycles };
@@ -388,6 +451,61 @@ impl Bus {
         self.timer.step(sub_cycles);
         if self.timer.overflow_irq { self.if_reg |= 0x04; }
         self.apu.step_with_fs(sub_cycles);
+    }
+}
+
+
+// ── ReplayCapture ──────────────────────────────────────────────────────────────
+/// Captures live replay frames from a running GbCore.
+/// Feeds both live streaming (state_json) and training record generation.
+#[derive(Debug, Default, Clone)]
+pub struct ReplayFrame {
+    pub frame_idx: u64,
+    pub t_cycles:  u64,
+    pub pc:        u16,
+    pub ly:        u8,
+    pub snapshot:  String, // mrom.snap.v1 JSON
+}
+
+#[derive(Debug, Default)]
+pub struct ReplayCapture {
+    pub frames:      Vec<ReplayFrame>,
+    pub max_frames:  usize,
+    pub rom_title:   String,
+}
+
+impl ReplayCapture {
+    pub fn new(max_frames: usize, rom_title: &str) -> Self {
+        ReplayCapture { frames: Vec::with_capacity(max_frames), max_frames, rom_title: rom_title.to_string() }
+    }
+
+    /// Record one frame from a live GbCore. Call after run_frame().
+    pub fn capture(&mut self, core: &GbCore) {
+        if self.frames.len() >= self.max_frames { return; }
+        self.frames.push(ReplayFrame {
+            frame_idx: core.clock.frame_count(),
+            t_cycles:  core.clock.t_cycles,
+            pc:        core.regs.pc,
+            ly:        core.bus.ppu.ly,
+            snapshot:  core.state_json(),
+        });
+    }
+
+    /// Export all captured frames as a replay manifest JSON (mrom.replay.v1)
+    pub fn to_json(&self) -> String {
+        let frames: Vec<String> = self.frames.iter().map(|f|
+            format!("{{"fi":{},"tc":{},"pc":{},"snap":{}}}", 
+                    f.frame_idx, f.t_cycles, f.pc, f.snapshot)
+        ).collect();
+        format!(
+            "{{"version":"mrom.replay.v1","rom":"{}","frame_count":{},"frames":[{}]}}",
+            self.rom_title, self.frames.len(), frames.join(",")
+        )
+    }
+
+    /// Write replay manifest to file
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
     }
 }
 
@@ -849,20 +967,27 @@ impl Timer {
 // ── Bus (Phase 4) ─────────────────────────────────────────────────────────────
 pub struct Bus {
     pub rom: Vec<u8>, pub ram: Vec<u8>,
-    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8, pub wram: [u8; 0x2000],
+    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8,
+    pub wram: [[u8; 0x1000]; 8], pub wram_bank: u8,
     pub hram: [u8; 0x7F], pub oam: [u8; 0xA0],
     pub io: [u8; 0x80], pub ie: u8, pub if_reg: u8,
     pub mbc: Mbc, pub ppu: Ppu, pub apu: Apu, pub timer: Timer,
     pub joypad: u8,
     pub double_speed: bool, pub speed_switch_armed: bool,
+    // CGB color palettes: [palette_idx][color_idx*2 | byte_offset] = 64 bytes each
+    pub bg_cpal:  [u8; 64], pub bg_cps:  u8,  // BCPS index register
+    pub obj_cpal: [u8; 64], pub obj_cps: u8,  // OCPS index register
 }
 impl Bus {
     pub fn new(cart: Cartridge) -> Self {
         let mbc = Mbc::new(cart.kind.clone());
-        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0, wram: [0u8;0x2000],
+        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0,
+              wram: [[0u8;0x1000]; 8], wram_bank: 1,
               hram: [0u8;0x7F], oam: [0u8;0xA0], io: [0u8;0x80], ie: 0, if_reg: 0,
               mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF,
-              double_speed: false, speed_switch_armed: false }
+              double_speed: false, speed_switch_armed: false,
+              bg_cpal: [0xFFu8; 64], bg_cps: 0,
+              obj_cpal: [0u8; 64],   obj_cps: 0 }
     }
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
@@ -874,8 +999,10 @@ impl Bus {
                     self.ram.get(off).copied().unwrap_or(0xFF)
                 } else { 0xFF }
             }
-            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize],
-            0xE000..=0xFDFF => self.wram[(addr-0xE000) as usize],
+            0xC000..=0xCFFF => self.wram[0][(addr-0xC000) as usize],
+            0xD000..=0xDFFF => self.wram[self.wram_bank as usize][(addr-0xD000) as usize],
+            0xE000..=0xEFFF => self.wram[0][(addr-0xE000) as usize],
+            0xF000..=0xFDFF => self.wram[self.wram_bank as usize][(addr-0xF000) as usize],
             0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize],
             0xFF00 => self.joypad,
             0xFF01..=0xFF03 => self.io[(addr-0xFF00) as usize],
@@ -903,7 +1030,8 @@ impl Bus {
                     }
                 }
             }
-            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize] = val,
+            0xC000..=0xCFFF => self.wram[0][(addr-0xC000) as usize] = val,
+            0xD000..=0xDFFF => self.wram[self.wram_bank as usize][(addr-0xD000) as usize] = val,
             0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize] = val,
             0xFF00 => self.joypad = val,
             0xFF04..=0xFF07 => self.timer.write((addr-0xFF00) as u8, val),
@@ -916,6 +1044,41 @@ impl Bus {
             _ => {}
         }
     }
+
+    /// Decode a CGB palette entry (2-byte little-endian RGB555) to (r8,g8,b8)
+    pub fn cgb_color(cpal: &[u8; 64], palette: u8, color: u8) -> (u8, u8, u8) {
+        let idx = (palette as usize) * 8 + (color as usize) * 2;
+        let lo = cpal[idx] as u16;
+        let hi = cpal[idx + 1] as u16;
+        let rgb = lo | (hi << 8);
+        let r = ((rgb & 0x001F) as u8) << 3;
+        let g = (((rgb >> 5) & 0x001F) as u8) << 3;
+        let b = (((rgb >> 10) & 0x001F) as u8) << 3;
+        (r, g, b)
+    }
+
+    /// Get full BG color palette as RGB888 array [palette][color] = (r,g,b)
+    pub fn bg_palette_rgb(&self) -> [[(u8,u8,u8); 4]; 8] {
+        let mut out = [[(0u8,0u8,0u8); 4]; 8];
+        for p in 0..8 {
+            for c in 0..4 {
+                out[p][c] = Self::cgb_color(&self.bg_cpal, p as u8, c as u8);
+            }
+        }
+        out
+    }
+
+    /// Get full OBJ color palette as RGB888 array [palette][color] = (r,g,b)
+    pub fn obj_palette_rgb(&self) -> [[(u8,u8,u8); 4]; 8] {
+        let mut out = [[(0u8,0u8,0u8); 4]; 8];
+        for p in 0..8 {
+            for c in 0..4 {
+                out[p][c] = Self::cgb_color(&self.obj_cpal, p as u8, c as u8);
+            }
+        }
+        out
+    }
+
     pub fn step_subsystems(&mut self, cycles: u8) {
         // In double-speed mode CPU runs 2x; PPU/APU/Timer stay at 1x speed
         let sub_cycles = if self.double_speed { (cycles + 1) / 2 } else { cycles };
@@ -925,6 +1088,61 @@ impl Bus {
         if self.ppu.stat_irq   { self.if_reg |= 0x02; }
         self.timer.step(cycles);
         if self.timer.overflow_irq { self.if_reg |= 0x04; }
+    }
+}
+
+
+// ── ReplayCapture ──────────────────────────────────────────────────────────────
+/// Captures live replay frames from a running GbCore.
+/// Feeds both live streaming (state_json) and training record generation.
+#[derive(Debug, Default, Clone)]
+pub struct ReplayFrame {
+    pub frame_idx: u64,
+    pub t_cycles:  u64,
+    pub pc:        u16,
+    pub ly:        u8,
+    pub snapshot:  String, // mrom.snap.v1 JSON
+}
+
+#[derive(Debug, Default)]
+pub struct ReplayCapture {
+    pub frames:      Vec<ReplayFrame>,
+    pub max_frames:  usize,
+    pub rom_title:   String,
+}
+
+impl ReplayCapture {
+    pub fn new(max_frames: usize, rom_title: &str) -> Self {
+        ReplayCapture { frames: Vec::with_capacity(max_frames), max_frames, rom_title: rom_title.to_string() }
+    }
+
+    /// Record one frame from a live GbCore. Call after run_frame().
+    pub fn capture(&mut self, core: &GbCore) {
+        if self.frames.len() >= self.max_frames { return; }
+        self.frames.push(ReplayFrame {
+            frame_idx: core.clock.frame_count(),
+            t_cycles:  core.clock.t_cycles,
+            pc:        core.regs.pc,
+            ly:        core.bus.ppu.ly,
+            snapshot:  core.state_json(),
+        });
+    }
+
+    /// Export all captured frames as a replay manifest JSON (mrom.replay.v1)
+    pub fn to_json(&self) -> String {
+        let frames: Vec<String> = self.frames.iter().map(|f|
+            format!("{{"fi":{},"tc":{},"pc":{},"snap":{}}}", 
+                    f.frame_idx, f.t_cycles, f.pc, f.snapshot)
+        ).collect();
+        format!(
+            "{{"version":"mrom.replay.v1","rom":"{}","frame_count":{},"frames":[{}]}}",
+            self.rom_title, self.frames.len(), frames.join(",")
+        )
+    }
+
+    /// Write replay manifest to file
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.to_json())
     }
 }
 
@@ -1457,6 +1675,14 @@ impl GbCore {
             // Handle ops that exec_op defers back to step()
             match op {
                 0x76 => { self.regs.pc = self.regs.pc.wrapping_sub(delta as u16); self.halted = true; }
+                0x10 => {
+                    // STOP: execute CGB double-speed switch if armed
+                    if self.bus.speed_switch_armed {
+                        self.bus.double_speed = !self.bus.double_speed;
+                        self.bus.speed_switch_armed = false;
+                    }
+                    // Consume STOP's second byte (always 0x00)
+                }
                 0xF3 => { self.ime = false; }
                 0xFB => { self.ime_pending = true; }
                 _ => {}
@@ -1493,7 +1719,7 @@ impl GbCore {
         );
         let t = self.clock.t_cycles;
         // Compact hex dump helpers
-        let wram_hex: String = self.bus.wram.iter().map(|b| format!("{:02x}",b)).collect();
+        let wram_hex: String = self.bus.wram.iter().flat_map(|bank| bank.iter()).map(|b| format!("{:02x}",b)).collect();
         let hram_hex: String = self.bus.hram.iter().map(|b| format!("{:02x}",b)).collect();
         let oam_hex:  String = self.bus.oam.iter().map(|b| format!("{:02x}",b)).collect();
         let v0_hex:   String = self.bus.vram[0].iter().map(|b| format!("{:02x}",b)).collect();
@@ -1516,10 +1742,171 @@ impl GbCore {
         json.into_bytes()
     }
 
+
+    /// Load emulator state from mrom.sav.v1 JSON bytes (from save_state())
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), CoreError> {
+        let s = std::str::from_utf8(data)
+            .map_err(|e| CoreError::InvalidRom(format!("load_state: utf8 error: {e}")))?;
+
+        fn parse_u64(s: &str, key: &str) -> Option<u64> {
+            let k = format!("\"{}\": ", key); // "key": 
+            let k2 = format!("\"{}\",", key); // tolerate both
+            let pos = s.find(&format!("\"{}\":", key))?;
+            let rest = &s[pos + key.len() + 3..];
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].parse().ok()
+        }
+        fn parse_bool(s: &str, key: &str) -> Option<bool> {
+            let pos = s.find(&format!("\"{}\":", key))?;
+            let rest = &s[pos + key.len() + 3..].trim_start_matches(' ');
+            Some(rest.starts_with("true"))
+        }
+        fn parse_hex(s: &str, key: &str) -> Option<Vec<u8>> {
+            let pos = s.find(&format!("\"{}\":\"", key))?;
+            let rest = &s[pos + key.len() + 4..];
+            let end = rest.find('"')?;
+            let hex = &rest[..end];
+            let bytes: Option<Vec<u8>> = (0..hex.len()/2)
+                .map(|i| u8::from_str_radix(&hex[i*2..i*2+2], 16).ok())
+                .collect();
+            bytes
+        }
+
+        // CPU registers from "cpu" sub-object
+        let cpu_start = s.find("\"cpu\":{").map(|i| i + 7).unwrap_or(0);
+        let cpu_str = if cpu_start > 0 {
+            let end = s[cpu_start..].find('}').map(|i| cpu_start + i + 1).unwrap_or(s.len());
+            &s[cpu_start..end]
+        } else { s };
+
+        macro_rules! pu8 {
+            ($k:expr) => { parse_u64(cpu_str, $k).unwrap_or(0) as u8 }
+        }
+        macro_rules! pu16 {
+            ($k:expr) => { parse_u64(cpu_str, $k).unwrap_or(0) as u16 }
+        }
+
+        self.regs.a  = pu8!("a");
+        self.regs.f  = pu8!("f");
+        self.regs.b  = pu8!("b");
+        self.regs.c  = pu8!("c");
+        self.regs.d  = pu8!("d");
+        self.regs.e  = pu8!("e");
+        self.regs.h  = pu8!("h");
+        self.regs.l  = pu8!("l");
+        self.regs.sp = pu16!("sp");
+        self.regs.pc = pu16!("pc");
+        self.halted  = parse_bool(cpu_str, "halted").unwrap_or(false);
+        self.ime     = parse_bool(cpu_str, "ime").unwrap_or(false);
+
+        // Top-level fields
+        if let Some(t) = parse_u64(s, "t_cycles") { self.clock.t_cycles = t; }
+        if let Some(rb) = parse_u64(s, "rom_bank") { self.bus.mbc.rom_bank = rb as u16; }
+        if let Some(rb) = parse_u64(s, "ram_bank") { self.bus.mbc.ram_bank = rb as u8; }
+        if let Some(vb) = parse_u64(s, "vram_bank") { self.bus.vram_bank = vb as u8; }
+        if let Some(ds) = parse_bool(s, "double_speed") { self.bus.double_speed = ds; }
+
+        // Memory banks
+        if let Some(wram_bytes) = parse_hex(s, "wram") {
+            for (i, b) in wram_bytes.iter().enumerate() {
+                let bank = i / 0x1000;
+                let off  = i % 0x1000;
+                if bank < 8 { self.bus.wram[bank][off] = *b; }
+            }
+        }
+        if let Some(hram_bytes) = parse_hex(s, "hram") {
+            for (i, b) in hram_bytes.iter().enumerate() {
+                if i < self.bus.hram.len() { self.bus.hram[i] = *b; }
+            }
+        }
+        if let Some(oam_bytes) = parse_hex(s, "oam") {
+            for (i, b) in oam_bytes.iter().enumerate() {
+                if i < self.bus.oam.len() { self.bus.oam[i] = *b; }
+            }
+        }
+        if let Some(v0) = parse_hex(s, "vram0") {
+            for (i, b) in v0.iter().enumerate() {
+                if i < 0x2000 { self.bus.vram[0][i] = *b; }
+            }
+        }
+        if let Some(v1) = parse_hex(s, "vram1") {
+            for (i, b) in v1.iter().enumerate() {
+                if i < 0x2000 { self.bus.vram[1][i] = *b; }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load save state from file
+    pub fn load_state_from_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let data = std::fs::read(path)?;
+        self.load_state(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+    }
+
     /// Write save state to file at `path`
     pub fn save_state_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
         std::fs::write(path, self.save_state())
     }
+
+    /// Get framebuffer as RGB888 bytes [r,g,b, r,g,b, ...] — 160×144×3 = 69,120 bytes
+    /// For DMG (non-CGB): maps 2-bit palette values to greyscale
+    /// For CGB: uses bg_cpal with direct palette index from tile attributes
+    /// (Phase 7 approximation: maps 2-bit value through BG palette 0)
+    pub fn framebuffer_rgb(&self) -> Vec<u8> {
+        let fb = &self.bus.ppu.framebuffer;
+        let is_cgb = self.bus.bg_cpal != [0xFFu8; 64];
+        let mut out = Vec::with_capacity(LCD_WIDTH * LCD_HEIGHT * 3);
+
+        for &px in fb.iter() {
+            let (r, g, b) = if is_cgb {
+                // Use CGB BG palette 0, color index = pixel value
+                Bus::cgb_color(&self.bus.bg_cpal, 0, px.min(3))
+            } else {
+                // DMG greyscale
+                let shade = match px.min(3) { 0 => 255, 1 => 170, 2 => 85, _ => 0 };
+                (shade, shade, shade)
+            };
+            out.push(r); out.push(g); out.push(b);
+        }
+        out
+    }
+
+    /// Encode framebuffer as compact base64-like hex string for JSON embedding
+    pub fn framebuffer_hex(&self) -> String {
+        self.framebuffer_rgb().iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    /// Full JSON snapshot for network broadcast / live replay
+    /// Format: mrom.snap.v1 — lightweight, designed for WebSocket streaming
+    pub fn state_json(&self) -> String {
+        let fb_hex = self.framebuffer_hex();
+        let cpu = format!(
+            "{{"pc":{},"sp":{},"a":{},"f":{}}}",
+            self.regs.pc, self.regs.sp, self.regs.a, self.regs.f
+        );
+        let bg_pal: String = self.bus.bg_cpal.iter().map(|b| format!("{:02x}",b)).collect();
+        format!(
+            concat!(
+                "{{"v":"mrom.snap.v1",",
+                ""f":{frame},"ly":{ly},"mode":{mode},",
+                ""cpu":{cpu},",
+                ""ds":{ds},"wb":{wb},"vb":{vb},",
+                ""bg_pal":"{bg_pal}",",
+                ""fb":"{fb}"}}"
+            ),
+            frame = self.clock.frame_count(),
+            ly = self.bus.ppu.ly,
+            mode = self.bus.ppu.mode as u8,
+            cpu = cpu,
+            ds = self.bus.double_speed,
+            wb = self.bus.wram_bank,
+            vb = self.bus.vram_bank,
+            bg_pal = bg_pal,
+            fb = fb_hex,
+        )
+    }
+
     pub fn state_summary(&self) -> String {
         format!(
             "PC={:#06x} SP={:#06x} A={:#04x} BC={:#06x} DE={:#06x} HL={:#06x} | Frame={} LY={} Mode={:?} | T={}",
