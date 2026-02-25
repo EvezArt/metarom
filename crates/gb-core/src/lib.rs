@@ -43,11 +43,13 @@ pub struct Mbc {
     pub ram_enable: bool,
     pub mode: u8,
     pub upper_bits: u8,
+    pub rtc_reg: [u8; 5], pub rtc_latch: [u8; 5], pub rtc_latch_state: u8, pub rtc_sel: u8,
 }
 
 impl Mbc {
     pub fn new(kind: CartridgeKind) -> Self {
-        Mbc { kind, rom_bank: 1, ram_bank: 0, ram_enable: false, mode: 0, upper_bits: 0 }
+        Mbc { kind, rom_bank: 1, ram_bank: 0, ram_enable: false, mode: 0, upper_bits: 0,
+              rtc_reg: [0u8;5], rtc_latch: [0u8;5], rtc_latch_state: 0, rtc_sel: 0xFF }
     }
     pub fn write(&mut self, addr: u16, val: u8) -> bool {
         match &self.kind {
@@ -79,7 +81,17 @@ impl Mbc {
                         self.rom_bank = if b == 0 { 1 } else { b };
                         true
                     }
-                    0x4000..=0x5FFF => { self.ram_bank = val & 0x07; true }
+                    0x4000..=0x5FFF => {
+                        if val <= 0x07 { self.ram_bank = val; self.rtc_sel = 0xFF; }
+                        else if (0x08..=0x0C).contains(&val) { self.rtc_sel = val - 0x08; }
+                        true
+                    }
+                    0x6000..=0x7FFF => {
+                        if self.rtc_latch_state == 0 && val == 0 { self.rtc_latch_state = 1; }
+                        else if self.rtc_latch_state == 1 && val == 1 { self.rtc_latch = self.rtc_reg; self.rtc_latch_state = 0; }
+                        else { self.rtc_latch_state = 0; }
+                        true
+                    }
                     _ => false,
                 }
             }
@@ -291,27 +303,33 @@ impl Timer {
 // ── Bus ───────────────────────────────────────────────────────────────────────
 pub struct Bus {
     pub rom: Vec<u8>, pub ram: Vec<u8>,
-    pub vram: [u8; 0x2000], pub wram: [u8; 0x2000],
+    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8, pub wram: [u8; 0x2000],
     pub hram: [u8; 0x7F], pub oam: [u8; 0xA0],
     pub io: [u8; 0x80], pub ie: u8, pub if_reg: u8,
     pub mbc: Mbc, pub ppu: Ppu, pub apu: Apu, pub timer: Timer,
     pub joypad: u8,
+    pub double_speed: bool, pub speed_switch_armed: bool,
 }
 impl Bus {
     pub fn new(cart: Cartridge) -> Self {
         let mbc = Mbc::new(cart.kind.clone());
-        Bus { rom: cart.rom, ram: cart.ram, vram: [0u8;0x2000], wram: [0u8;0x2000],
+        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0, wram: [0u8;0x2000],
               hram: [0u8;0x7F], oam: [0u8;0xA0], io: [0u8;0x80], ie: 0, if_reg: 0,
-              mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF }
+              mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF,
+              double_speed: false, speed_switch_armed: false }
     }
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => { let m=self.mbc.rom_addr(addr); self.rom.get(m).copied().unwrap_or(0xFF) }
-            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize],
+            0x8000..=0x9FFF => self.vram[self.vram_bank as usize][(addr-0x8000) as usize],
             0xA000..=0xBFFF => {
                 if self.mbc.ram_enable {
-                    let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
-                    self.ram.get(off).copied().unwrap_or(0xFF)
+                    if matches!(self.mbc.kind, CartridgeKind::Mbc3) && self.mbc.rtc_sel != 0xFF {
+                        self.mbc.rtc_latch[self.mbc.rtc_sel as usize]
+                    } else {
+                        let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
+                        self.ram.get(off).copied().unwrap_or(0xFF)
+                    }
                 } else { 0xFF }
             }
             0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize],
@@ -324,6 +342,8 @@ impl Bus {
             0xFF10..=0xFF3F => 0xFF,
             0xFF40..=0xFF45 | 0xFF47..=0xFF4B => self.ppu.read_reg((addr-0xFF00) as u8),
             0xFF46 => 0xFF,
+            0xFF4D => (if self.double_speed {0x80} else {0}) | (if self.speed_switch_armed {0x01} else {0}),
+            0xFF4F => 0xFE | self.vram_bank,
             0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize],
             0xFFFF => self.ie,
             _ => 0xFF,
@@ -332,11 +352,15 @@ impl Bus {
     pub fn write(&mut self, addr: u16, val: u8) {
         if self.mbc.write(addr, val) { return; }
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize] = val,
+            0x8000..=0x9FFF => self.vram[self.vram_bank as usize][(addr-0x8000) as usize] = val,
             0xA000..=0xBFFF => {
                 if self.mbc.ram_enable {
-                    let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
-                    if off < self.ram.len() { self.ram[off] = val; }
+                    if matches!(self.mbc.kind, CartridgeKind::Mbc3) && self.mbc.rtc_sel != 0xFF {
+                        self.mbc.rtc_reg[self.mbc.rtc_sel as usize] = val;
+                    } else {
+                        let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
+                        if off < self.ram.len() { self.ram[off] = val; }
+                    }
                 }
             }
             0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize] = val,
@@ -346,6 +370,8 @@ impl Bus {
             0xFF0F => self.if_reg = val,
             0xFF10..=0xFF3F => self.apu.write_reg((addr-0xFF00) as u8, val),
             0xFF40..=0xFF45 | 0xFF47..=0xFF4B => self.ppu.write_reg((addr-0xFF00) as u8, val),
+            0xFF4D => self.speed_switch_armed = val & 0x01 != 0,
+            0xFF4F => self.vram_bank = val & 0x01,
             0xFF46 => { let src=(val as u16)<<8; for i in 0..0xA0u16 { let b=self.read(src+i); self.oam[i as usize]=b; } }
             0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize] = val,
             0xFFFF => self.ie = val,
@@ -353,12 +379,15 @@ impl Bus {
         }
     }
     pub fn step_subsystems(&mut self, cycles: u8) {
-        let vram = self.vram; let oam = self.oam;
-        self.ppu.step(cycles, &vram, &oam);
+        // In double-speed mode CPU runs 2x; PPU/APU/Timer stay at 1x speed
+        let sub_cycles = if self.double_speed { (cycles + 1) / 2 } else { cycles };
+        let vram = self.vram[self.vram_bank as usize]; let oam = self.oam;
+        self.ppu.step(sub_cycles, &vram, &oam);
         if self.ppu.vblank_irq { self.if_reg |= 0x01; }
         if self.ppu.stat_irq   { self.if_reg |= 0x02; }
-        self.timer.step(cycles);
+        self.timer.step(sub_cycles);
         if self.timer.overflow_irq { self.if_reg |= 0x04; }
+        self.apu.step_with_fs(sub_cycles);
     }
 }
 
@@ -696,7 +725,7 @@ impl NoiseChannel {
 
 #[derive(Debug, Clone)]
 pub struct Apu {
-    pub power: bool, pub master_vol: u8,
+    pub power: bool, pub master_vol: u8, pub nr51: u8,
     pub sq1: Square, pub sq2: Square, pub wave: WaveChannel, pub noise: NoiseChannel,
     pub sample_buffer: Vec<i16>,
     sample_timer: u32,
@@ -707,7 +736,8 @@ impl Default for Apu {
         Apu { power:false, master_vol:0, sq1:Square::default(), sq2:Square::default(),
                wave:WaveChannel::default(), noise:NoiseChannel::default(),
                sample_buffer: Vec::with_capacity(APU_SAMPLES_PER_FRAME * 2),
-               sample_timer: (CPU_HZ / APU_SAMPLE_RATE as u64) as u32 }
+               sample_timer: (CPU_HZ / APU_SAMPLE_RATE as u64) as u32,
+               fs_counter: 0, wave_len: 256, noise_len: 64, fs_div: 0, nr51: 0xFF }
     }
 }
 impl Apu {
@@ -736,7 +766,7 @@ impl Apu {
             0x1D=>self.wave.nr3=v, 0x1E=>{ self.wave.nr4=v; if v&0x80!=0 {self.wave.enabled=true;} }
             0x20=>self.noise.nr1=v, 0x21=>self.noise.nr2=v, 0x22=>self.noise.nr3=v,
             0x23=>{ self.noise.nr4=v; if v&0x80!=0 {self.noise.trigger();} }
-            0x24=>self.master_vol=v, 0x26=>self.power=v&0x80!=0,
+            0x24=>self.master_vol=v, 0x25=>self.nr51=v, 0x26=>self.power=v&0x80!=0,
             0x30..=0x3F=>self.wave.wave_ram[(r-0x30) as usize]=v,
             _=>{}
         }
@@ -819,23 +849,25 @@ impl Timer {
 // ── Bus (Phase 4) ─────────────────────────────────────────────────────────────
 pub struct Bus {
     pub rom: Vec<u8>, pub ram: Vec<u8>,
-    pub vram: [u8; 0x2000], pub wram: [u8; 0x2000],
+    pub vram: [[u8; 0x2000]; 2], pub vram_bank: u8, pub wram: [u8; 0x2000],
     pub hram: [u8; 0x7F], pub oam: [u8; 0xA0],
     pub io: [u8; 0x80], pub ie: u8, pub if_reg: u8,
     pub mbc: Mbc, pub ppu: Ppu, pub apu: Apu, pub timer: Timer,
     pub joypad: u8,
+    pub double_speed: bool, pub speed_switch_armed: bool,
 }
 impl Bus {
     pub fn new(cart: Cartridge) -> Self {
         let mbc = Mbc::new(cart.kind.clone());
-        Bus { rom: cart.rom, ram: cart.ram, vram: [0u8;0x2000], wram: [0u8;0x2000],
+        Bus { rom: cart.rom, ram: cart.ram, vram: [[0u8;0x2000]; 2], vram_bank: 0, wram: [0u8;0x2000],
               hram: [0u8;0x7F], oam: [0u8;0xA0], io: [0u8;0x80], ie: 0, if_reg: 0,
-              mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF }
+              mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF,
+              double_speed: false, speed_switch_armed: false }
     }
     pub fn read(&self, addr: u16) -> u8 {
         match addr {
             0x0000..=0x7FFF => { let m=self.mbc.rom_addr(addr); self.rom.get(m).copied().unwrap_or(0xFF) }
-            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize],
+            0x8000..=0x9FFF => self.vram[self.vram_bank as usize][(addr-0x8000) as usize],
             0xA000..=0xBFFF => {
                 if self.mbc.ram_enable {
                     let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
@@ -860,11 +892,15 @@ impl Bus {
     pub fn write(&mut self, addr: u16, val: u8) {
         if self.mbc.write(addr, val) { return; }
         match addr {
-            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize] = val,
+            0x8000..=0x9FFF => self.vram[self.vram_bank as usize][(addr-0x8000) as usize] = val,
             0xA000..=0xBFFF => {
                 if self.mbc.ram_enable {
-                    let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
-                    if off < self.ram.len() { self.ram[off] = val; }
+                    if matches!(self.mbc.kind, CartridgeKind::Mbc3) && self.mbc.rtc_sel != 0xFF {
+                        self.mbc.rtc_reg[self.mbc.rtc_sel as usize] = val;
+                    } else {
+                        let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
+                        if off < self.ram.len() { self.ram[off] = val; }
+                    }
                 }
             }
             0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize] = val,
@@ -881,13 +917,14 @@ impl Bus {
         }
     }
     pub fn step_subsystems(&mut self, cycles: u8) {
-        let vram = self.vram; let oam = self.oam;
-        self.ppu.step(cycles, &vram, &oam);
+        // In double-speed mode CPU runs 2x; PPU/APU/Timer stay at 1x speed
+        let sub_cycles = if self.double_speed { (cycles + 1) / 2 } else { cycles };
+        let vram = self.vram[self.vram_bank as usize]; let oam = self.oam;
+        self.ppu.step(sub_cycles, &vram, &oam);
         if self.ppu.vblank_irq { self.if_reg |= 0x01; }
         if self.ppu.stat_irq   { self.if_reg |= 0x02; }
         self.timer.step(cycles);
         if self.timer.overflow_irq { self.if_reg |= 0x04; }
-        self.apu.step_with_fs(cycles);
     }
 }
 
@@ -1444,6 +1481,44 @@ impl GbCore {
             out.push('\n');
         }
         out
+    }
+
+    /// Serialize current emulator state to .mrom.sav JSON bytes
+    pub fn save_state(&self) -> Vec<u8> {
+        let cpu = format!(
+            "{{"pc":{},"sp":{},"a":{},"f":{},"b":{},"c":{},"d":{},"e":{},"h":{},"l":{},"halted":{},"ime":{}}}",
+            self.regs.pc, self.regs.sp, self.regs.a, self.regs.f,
+            self.regs.b, self.regs.c, self.regs.d, self.regs.e, self.regs.h, self.regs.l,
+            self.halted, self.ime
+        );
+        let t = self.clock.t_cycles;
+        // Compact hex dump helpers
+        let wram_hex: String = self.bus.wram.iter().map(|b| format!("{:02x}",b)).collect();
+        let hram_hex: String = self.bus.hram.iter().map(|b| format!("{:02x}",b)).collect();
+        let oam_hex:  String = self.bus.oam.iter().map(|b| format!("{:02x}",b)).collect();
+        let v0_hex:   String = self.bus.vram[0].iter().map(|b| format!("{:02x}",b)).collect();
+        let v1_hex:   String = self.bus.vram[1].iter().map(|b| format!("{:02x}",b)).collect();
+        let json = format!(
+            concat!(
+                "{{"version":"mrom.sav.v1",",
+                ""t_cycles":{t},",
+                ""cpu":{cpu},",
+                ""rom_bank":{rom_bank},"ram_bank":{ram_bank},",
+                ""vram_bank":{vb},"double_speed":{ds},",
+                ""wram":"{wram}","hram":"{hram}","oam":"{oam}",",
+                ""vram0":"{v0}","vram1":"{v1}"}}"
+            ),
+            t=t, cpu=cpu,
+            rom_bank=self.bus.mbc.rom_bank, ram_bank=self.bus.mbc.ram_bank,
+            vb=self.bus.vram_bank, ds=self.bus.double_speed,
+            wram=wram_hex, hram=hram_hex, oam=oam_hex, v0=v0_hex, v1=v1_hex
+        );
+        json.into_bytes()
+    }
+
+    /// Write save state to file at `path`
+    pub fn save_state_to_file(&self, path: &std::path::Path) -> std::io::Result<()> {
+        std::fs::write(path, self.save_state())
     }
     pub fn state_summary(&self) -> String {
         format!(

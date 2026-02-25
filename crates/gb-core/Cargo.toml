@@ -1,8 +1,8 @@
 [package]
 name = "gb-core"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
-description = "MetaROM Game Boy emulator core — Phase 5"
+description = "MetaROM Game Boy emulator core — Phase 6 (CGB hardware, RTC, save state)"
 
 [[bin]]
 name = "letsplay"

@@ -16,86 +16,64 @@ metarom/
 │   ├── capability_graph.schema.json
 │   ├── game_requirement.schema.json
 │   ├── sts_profile.schema.json
-│   └── training_record.schema.json    # .mrom.train.json schema (Phase 4+)
+│   └── training_record.schema.json
 ├── crates/
-│   ├── gb-core/                       # Game Boy emulator core
+│   ├── gb-core/
 │   │   └── src/
-│   │       ├── lib.rs                 # Phase 5: full SM83, APU HW timers, training
+│   │       ├── lib.rs              # Phase 6: CGB hardware, MBC3 RTC, save state
 │   │       └── bin/
-│   │           ├── letsplay.rs        # ASCII frame renderer
-│   │           ├── letsplay_train.rs  # Single-ROM training extractor
-│   │           └── letsplay_batch.rs  # Batch ROM-to-training runner (Phase 5)
-│   ├── ucf-planner/                   # UCF planning engine
-│   └── mrom-ecore-abi/                # C-ABI for .mrom arcade cart modules
+│   │           ├── letsplay.rs
+│   │           ├── letsplay_train.rs
+│   │           └── letsplay_batch.rs
+│   ├── ucf-planner/
+│   └── mrom-ecore-abi/
 └── examples/
-    └── ps2_to_pc_req.json
 ```
 
-## Phase 5 Features
+## Phase history
 
-- **Full SM83 instruction set** — all 251 opcodes correctly implemented via `exec_op()`
-  - Complete LD r8/r8 grid (64 instructions, 0x40–0x7F)
-  - Full ALU grid: ADD/ADC/SUB/SBC/AND/XOR/OR/CP with r8 and d8 operands (0x80–0xBF, 0xC6–0xFE)
-  - All flag-correct arithmetic: half-carry, carry, zero, subtract
-  - **DAA** (BCD correction) — complete implementation
-  - **PUSH/POP** all register pairs including AF (with F lower nibble mask)
-  - Conditional jumps: JP cc, JR cc with taken/not-taken cycle counts
-  - Conditional CALL cc (24 cycles taken, 12 not-taken)
-  - Conditional RET cc (20 cycles taken, 8 not-taken)
-  - RST handlers, LDH, LD (C)/A, ADD SP/e8, LD HL SP+e8
-- **APU frame sequencer** — 512Hz hardware timer (every 8192 cycles)
-  - Length counter: clocks at steps 0, 2, 4, 6 — disables channel at zero
-  - Frequency sweep (Square1 NR10): clocks at steps 2, 6
-  - Envelope: clocks at step 7 — volume ramp up/down per channel
-  - sweep_shadow register, sweep_enabled, sweep_timer
-- **Batch ROM runner** — `letsplay_batch` processes entire ROM directories
-  - One `.mrom.train.json` per ROM, written to output directory
-  - `batch_manifest.json` — summary of all runs (title, epoch, frames, ok/fail)
-  - Handles .gb, .gbc, .rom extensions
-  - Graceful error handling per ROM (bad ROM doesn't stop batch)
+| Phase | What shipped |
+|-------|-------------|
+| 3 | PPU modes 0-3, STAT, DIV/TIMA, MBC1/3/5, CB-prefix opcodes, framebuffer |
+| 4 | OAM sprites, window layer, palette registers, APU channels (Sq1/2/Wave/Noise), training extractor |
+| 5 | Full SM83 ISA (251 opcodes), APU frame sequencer, `letsplay_batch` batch runner |
+| 6 | CGB VRAM bank switching, double-speed mode, MBC3 RTC, NR51 panning, save state API |
+
+## Phase 6 Features
+
+- **CGB VRAM bank switching** — `vram: [[u8;0x2000]; 2]`, FF4F register, bank 0/1
+- **CGB double-speed mode** — KEY1 (FF4D) register, speed_switch_armed flag; subsystems run at half rate in 2x mode
+- **MBC3 full RTC** — 5 RTC registers (S/M/H/DL/DH), latch via 0x6000-0x7FFF 0→1 sequence, select via 0x08-0x0C
+- **NR51 panning** — FF25 register wired into Apu, default 0xFF (all channels both speakers)
+- **Save state API** — `GbCore::save_state() -> Vec<u8>`, `save_state_to_file(path)`, `mrom.sav.v1` JSON format
 
 ## Quick start
 
 ```bash
-# Build all
 cargo build
 
-# Single ROM training (60 frames)
+# Single ROM training (60 frames → JSON)
 cargo run --bin letsplay_train -- 60 output.mrom.train.json
 
-# Batch: process every .gb/.gbc in roms/ → training_output/
+# Batch: every .gb/.gbc in roms/ (300 frames each)
 cargo run --bin letsplay_batch -- roms/ training_output/ 300
 
-# ASCII renderer
-cargo run --bin letsplay -- 10
-
-# UCF planner
-cargo run -p ucf-planner -- plan --artifact examples/game_req.json --target examples/pc_cap.json
+# Save state example (Rust API)
+let bytes = core.save_state();
+core.save_state_to_file(Path::new("game.mrom.sav")).unwrap();
 ```
 
 ## Training pipeline
 
 ```
-roms/
-├── tetris.gb      ──→  training_output/tetris.mrom.train.json
-├── zelda.gb       ──→  training_output/zelda.mrom.train.json
-└── pokemon.gb     ──→  training_output/pokemon.mrom.train.json
-                         training_output/batch_manifest.json
-
-Each .mrom.train.json feeds into EVEZ-OS console_war_trainer for epoch progression.
+roms/*.gb/.gbc → letsplay_batch → training_output/*.mrom.train.json
+                                   + batch_manifest.json
+                                        ↓
+                              EVEZ-OS console_war_trainer
+                                        ↓
+                              epoch progression (gen1_nes → gen2_snes_genesis → ...)
 ```
-
-Epoch classification:
-- `gen1_nes` — DMG cartridges (non-CGB)
-- `gen2_snes_genesis` — CGB cartridges
-
-## Architecture
-
-- **GapVector** — pure diagnostic; never implies compensation
-- **Strategy** — scored against gaps + policy to select execution path
-- **PlanCandidate** — carries compensation map, mode-aware rollback prefs
-- **CompatibilityPlan** — output artifact with pipeline, rationale, scores
 
 ## License
 
-AGPL-3.0 (community/free tier). Commercial licenses available — see [EVEZ OS](https://evez-autonomizer.vercel.app).
+AGPL-3.0 (community/free tier). Commercial licenses available.
