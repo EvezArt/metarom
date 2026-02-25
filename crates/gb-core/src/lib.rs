@@ -430,7 +430,463 @@ fn exec_cb(regs: &mut Registers, bus: &mut Bus) -> u8 {
 }
 
 // ── SM83 decode table ─────────────────────────────────────────────────────────
-#[inline(always)]
+
+// ── Sprite ────────────────────────────────────────────────────────────────────
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Sprite {
+    pub y: u8, pub x: u8, pub tile: u8, pub flags: u8,
+}
+impl Sprite {
+    pub fn from_oam(oam: &[u8; 0xA0], idx: usize) -> Self {
+        let b = idx * 4;
+        Sprite { y: oam[b], x: oam[b+1], tile: oam[b+2], flags: oam[b+3] }
+    }
+    pub fn screen_y(&self) -> i32 { self.y as i32 - 16 }
+    pub fn screen_x(&self) -> i32 { self.x as i32 - 8 }
+    pub fn bg_priority(&self) -> bool { self.flags & 0x80 != 0 }
+    pub fn y_flip(&self)    -> bool { self.flags & 0x40 != 0 }
+    pub fn x_flip(&self)    -> bool { self.flags & 0x20 != 0 }
+    pub fn palette(&self)   -> u8   { (self.flags >> 4) & 0x01 }
+}
+
+fn apply_palette(pal: u8, c: u8) -> u8 { (pal >> (c * 2)) & 0x03 }
+
+// ── PPU (Phase 4) ─────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PpuMode { HBlank = 0, VBlank = 1, OamScan = 2, Drawing = 3 }
+
+#[derive(Debug, Clone)]
+pub struct Ppu {
+    pub mode: PpuMode, pub dot: u32, pub ly: u8, pub lyc: u8,
+    pub lcdc: u8, pub stat: u8, pub scy: u8, pub scx: u8,
+    pub wy: u8, pub wx: u8, pub wlc: u8,
+    pub pal_bg: u8, pub pal_obj0: u8, pub pal_obj1: u8,
+    pub framebuffer: Vec<u8>,
+    pub frame_ready: bool, pub stat_irq: bool, pub vblank_irq: bool,
+}
+impl Ppu {
+    pub fn new() -> Self {
+        Ppu { mode: PpuMode::OamScan, dot: 0, ly: 0, lyc: 0,
+               lcdc: 0x91, stat: 0, scy: 0, scx: 0,
+               wy: 0, wx: 0, wlc: 0,
+               pal_bg: 0xFC, pal_obj0: 0xFF, pal_obj1: 0xFF,
+               framebuffer: vec![0u8; LCD_WIDTH * LCD_HEIGHT],
+               frame_ready: false, stat_irq: false, vblank_irq: false }
+    }
+    pub fn step(&mut self, cycles: u8, vram: &[u8; 0x2000], oam: &[u8; 0xA0]) {
+        if self.lcdc & 0x80 == 0 { return; }
+        self.stat_irq = false; self.vblank_irq = false;
+        self.dot += cycles as u32;
+        match self.mode {
+            PpuMode::OamScan => {
+                if self.dot >= PPU_MODE2_CYCLES { self.dot -= PPU_MODE2_CYCLES; self.mode = PpuMode::Drawing; }
+            }
+            PpuMode::Drawing => {
+                if self.dot >= PPU_MODE3_CYCLES {
+                    self.dot -= PPU_MODE3_CYCLES;
+                    self.render_scanline(vram, oam);
+                    self.mode = PpuMode::HBlank;
+                    if self.stat & 0x08 != 0 { self.stat_irq = true; }
+                }
+            }
+            PpuMode::HBlank => {
+                if self.dot >= PPU_MODE0_CYCLES {
+                    self.dot -= PPU_MODE0_CYCLES; self.ly += 1; self.check_lyc();
+                    if self.ly >= PPU_VBLANK_LINE as u8 {
+                        self.mode = PpuMode::VBlank; self.vblank_irq = true; self.frame_ready = true;
+                        if self.stat & 0x10 != 0 { self.stat_irq = true; }
+                    } else {
+                        self.mode = PpuMode::OamScan;
+                        if self.stat & 0x20 != 0 { self.stat_irq = true; }
+                    }
+                }
+            }
+            PpuMode::VBlank => {
+                if self.dot >= DOTS_PER_LINE {
+                    self.dot -= DOTS_PER_LINE; self.ly += 1; self.check_lyc();
+                    if self.ly > 153 {
+                        self.ly = 0; self.wlc = 0; self.mode = PpuMode::OamScan; self.frame_ready = false;
+                        if self.stat & 0x20 != 0 { self.stat_irq = true; }
+                    }
+                }
+            }
+        }
+        self.stat = (self.stat & 0xFC) | (self.mode as u8);
+    }
+    fn check_lyc(&mut self) {
+        if self.ly == self.lyc { self.stat |= 0x04; if self.stat & 0x40 != 0 { self.stat_irq = true; } }
+        else { self.stat &= !0x04; }
+    }
+    fn render_scanline(&mut self, vram: &[u8; 0x2000], oam: &[u8; 0xA0]) {
+        let ly = self.ly as usize;
+        if ly >= LCD_HEIGHT { return; }
+        let lcdc = self.lcdc;
+        let row_base = ly * LCD_WIDTH;
+        let mut bg_col = [0u8; LCD_WIDTH];
+        let mut bg_opaque = [false; LCD_WIDTH];
+
+        // BG layer
+        if lcdc & 0x01 != 0 {
+            let map_base: usize  = if lcdc & 0x08 != 0 { 0x1C00 } else { 0x1800 };
+            let data_base: usize = if lcdc & 0x10 != 0 { 0x0000 } else { 0x0800 };
+            let signed = lcdc & 0x10 == 0;
+            let map_y = (ly.wrapping_add(self.scy as usize)) & 0xFF;
+            let tile_row = map_y >> 3; let prow = map_y & 7;
+            for x in 0..LCD_WIDTH {
+                let map_x = (x.wrapping_add(self.scx as usize)) & 0xFF;
+                let tc = map_x >> 3; let pc = map_x & 7;
+                let idx = vram[map_base + tile_row * 32 + tc];
+                let ta = if signed {
+                    (data_base as i32 + idx as i8 as i32 * 16 + prow as i32 * 2) as usize
+                } else { data_base + idx as usize * 16 + prow * 2 };
+                let lo = *vram.get(ta).unwrap_or(&0);
+                let hi = *vram.get(ta+1).unwrap_or(&0);
+                let bit = 7 - pc;
+                let c = ((hi>>bit)&1)<<1 | ((lo>>bit)&1);
+                bg_col[x] = apply_palette(self.pal_bg, c);
+                bg_opaque[x] = c != 0;
+            }
+        }
+
+        // Window layer
+        let wx7 = self.wx.saturating_sub(7) as usize;
+        if lcdc & 0x20 != 0 && ly >= self.wy as usize && wx7 < LCD_WIDTH {
+            let wmap: usize  = if lcdc & 0x40 != 0 { 0x1C00 } else { 0x1800 };
+            let data_base: usize = if lcdc & 0x10 != 0 { 0x0000 } else { 0x0800 };
+            let signed = lcdc & 0x10 == 0;
+            let wly = self.wlc as usize;
+            let tile_row = wly >> 3; let prow = wly & 7;
+            for x in wx7..LCD_WIDTH {
+                let tc = (x - wx7) >> 3; let pc = (x - wx7) & 7;
+                let idx = *vram.get(wmap + tile_row * 32 + tc).unwrap_or(&0);
+                let ta = if signed {
+                    (data_base as i32 + idx as i8 as i32 * 16 + prow as i32 * 2) as usize
+                } else { data_base + idx as usize * 16 + prow * 2 };
+                let lo = *vram.get(ta).unwrap_or(&0);
+                let hi = *vram.get(ta+1).unwrap_or(&0);
+                let bit = 7 - pc;
+                let c = ((hi>>bit)&1)<<1 | ((lo>>bit)&1);
+                bg_col[x] = apply_palette(self.pal_bg, c);
+                bg_opaque[x] = c != 0;
+            }
+            self.wlc = self.wlc.wrapping_add(1);
+        }
+
+        // OAM sprites
+        if lcdc & 0x02 != 0 {
+            let sh: i32 = if lcdc & 0x04 != 0 { 16 } else { 8 };
+            let mut visible: Vec<(i32, Sprite)> = Vec::with_capacity(10);
+            for i in 0..40 {
+                let s = Sprite::from_oam(oam, i);
+                let sy = s.screen_y();
+                if (ly as i32) >= sy && (ly as i32) < sy + sh {
+                    visible.push((s.screen_x(), s));
+                    if visible.len() == 10 { break; }
+                }
+            }
+            visible.sort_by_key(|&(x,_)| x);
+            for (_,s) in visible.iter().rev() {
+                let sy = s.screen_y();
+                let mut row = (ly as i32 - sy) as usize;
+                if s.y_flip() { row = (sh as usize) - 1 - row; }
+                let tile = if sh == 16 { if row < 8 { s.tile & 0xFE } else { s.tile | 0x01 } } else { s.tile };
+                let ta = tile as usize * 16 + (row & 7) * 2;
+                let lo = *vram.get(ta).unwrap_or(&0);
+                let hi = *vram.get(ta+1).unwrap_or(&0);
+                let pal = if s.palette() == 0 { self.pal_obj0 } else { self.pal_obj1 };
+                for bi in 0..8usize {
+                    let sx = s.screen_x() + bi as i32;
+                    if sx < 0 || sx >= LCD_WIDTH as i32 { continue; }
+                    let bit = if s.x_flip() { bi } else { 7 - bi };
+                    let c = ((hi>>bit)&1)<<1 | ((lo>>bit)&1);
+                    if c == 0 { continue; }
+                    let px = sx as usize;
+                    if s.bg_priority() && bg_opaque[px] { continue; }
+                    bg_col[px] = apply_palette(pal, c);
+                }
+            }
+        }
+
+        for x in 0..LCD_WIDTH { self.framebuffer[row_base + x] = bg_col[x]; }
+    }
+    pub fn read_reg(&self, r: u8) -> u8 {
+        match r {
+            0x40=>self.lcdc, 0x41=>self.stat|0x80, 0x42=>self.scy, 0x43=>self.scx,
+            0x44=>self.ly, 0x45=>self.lyc, 0x47=>self.pal_bg,
+            0x48=>self.pal_obj0, 0x49=>self.pal_obj1, 0x4A=>self.wy, 0x4B=>self.wx, _=>0xFF
+        }
+    }
+    pub fn write_reg(&mut self, r: u8, v: u8) {
+        match r {
+            0x40=>self.lcdc=v, 0x41=>self.stat=(self.stat&0x87)|(v&0x78),
+            0x42=>self.scy=v, 0x43=>self.scx=v, 0x44=>{}, 0x45=>self.lyc=v,
+            0x47=>self.pal_bg=v, 0x48=>self.pal_obj0=v, 0x49=>self.pal_obj1=v,
+            0x4A=>self.wy=v, 0x4B=>self.wx=v, _=>{}
+        }
+    }
+}
+
+// ── APU (Phase 4) ─────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Default)]
+pub struct Square {
+    pub nr0: u8, pub nr1: u8, pub nr2: u8, pub nr3: u8, pub nr4: u8,
+    pub enabled: bool, pub freq_timer: u32, pub duty_pos: u8,
+    pub volume: u8, pub env_timer: u8, pub len_timer: u16,
+}
+impl Square {
+    fn period(&self) -> u32 {
+        let freq = ((self.nr4 as u32 & 0x07) << 8) | self.nr3 as u32;
+        (2048 - freq) * 4
+    }
+    fn duty_hi(&self) -> u8 {
+        match (self.nr1 >> 6) & 3 { 0=>0b00000001, 1=>0b10000001, 2=>0b10000111, _=>0b01111110 }
+    }
+    pub fn tick(&mut self) {
+        if self.freq_timer == 0 { self.freq_timer = self.period(); self.duty_pos = (self.duty_pos+1)&7; }
+        else { self.freq_timer -= 1; }
+    }
+    pub fn sample(&self) -> i16 {
+        if !self.enabled { return 0; }
+        if (self.duty_hi() >> (7-self.duty_pos)) & 1 != 0 { self.volume as i16 * 256 } else { 0 }
+    }
+    pub fn trigger(&mut self) {
+        self.enabled = true; self.freq_timer = self.period();
+        self.volume = (self.nr2 >> 4) & 0x0F; self.env_timer = self.nr2 & 0x07;
+        self.len_timer = if self.nr1 & 0x3F == 0 { 64 } else { 64 - (self.nr1 as u16 & 0x3F) };
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct WaveChannel {
+    pub enabled: bool, pub nr0: u8, pub nr1: u8, pub nr2: u8, pub nr3: u8, pub nr4: u8,
+    pub wave_ram: [u8; 16], pub pos: u8, pub freq_timer: u32,
+}
+impl WaveChannel {
+    pub fn tick(&mut self) {
+        if self.freq_timer == 0 {
+            let freq = ((self.nr4 as u32 & 0x07) << 8) | self.nr3 as u32;
+            self.freq_timer = (2048 - freq) * 2; self.pos = (self.pos+1) & 31;
+        } else { self.freq_timer -= 1; }
+    }
+    pub fn sample(&self) -> i16 {
+        if !self.enabled || self.nr0 & 0x80 == 0 { return 0; }
+        let byte = self.wave_ram[(self.pos >> 1) as usize];
+        let nib = if self.pos & 1 == 0 { byte >> 4 } else { byte & 0x0F };
+        let shift = match (self.nr2>>5)&3 { 0=>4, 1=>0, 2=>1, _=>2 };
+        ((nib >> shift) as i16) * 512
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NoiseChannel {
+    pub enabled: bool, pub nr1: u8, pub nr2: u8, pub nr3: u8, pub nr4: u8,
+    pub lfsr: u16, pub freq_timer: u32, pub volume: u8,
+}
+impl NoiseChannel {
+    pub fn tick(&mut self) {
+        if self.freq_timer == 0 {
+            let r = self.nr3 & 7; let s = (self.nr3 >> 4) & 0x0F;
+            let div: u32 = if r==0 {8} else {r as u32 * 16};
+            self.freq_timer = div << s;
+            let xor = (self.lfsr & 1) ^ ((self.lfsr>>1) & 1);
+            self.lfsr = (self.lfsr >> 1) | (xor << 14);
+            if self.nr3 & 0x08 != 0 { self.lfsr = (self.lfsr & !0x40) | (xor << 6); }
+        } else { self.freq_timer -= 1; }
+    }
+    pub fn sample(&self) -> i16 {
+        if !self.enabled { return 0; }
+        if self.lfsr & 1 == 0 { self.volume as i16 * 256 } else { 0 }
+    }
+    pub fn trigger(&mut self) { self.enabled = true; self.lfsr = 0x7FFF; self.volume = (self.nr2>>4)&0x0F; }
+}
+
+#[derive(Debug, Clone)]
+pub struct Apu {
+    pub power: bool, pub master_vol: u8,
+    pub sq1: Square, pub sq2: Square, pub wave: WaveChannel, pub noise: NoiseChannel,
+    pub sample_buffer: Vec<i16>,
+    sample_timer: u32,
+}
+impl Default for Apu {
+    fn default() -> Self {
+        Apu { power:false, master_vol:0, sq1:Square::default(), sq2:Square::default(),
+               wave:WaveChannel::default(), noise:NoiseChannel::default(),
+               sample_buffer: Vec::with_capacity(APU_SAMPLES_PER_FRAME * 2),
+               sample_timer: (CPU_HZ / APU_SAMPLE_RATE as u64) as u32 }
+    }
+}
+impl Apu {
+    pub fn step(&mut self, cycles: u8) {
+        for _ in 0..cycles {
+            self.sq1.tick(); self.sq2.tick(); self.wave.tick(); self.noise.tick();
+            if self.sample_timer == 0 {
+                self.sample_timer = (CPU_HZ / APU_SAMPLE_RATE as u64) as u32;
+                let mix = (self.sq1.sample() + self.sq2.sample() + self.wave.sample() + self.noise.sample()) / 4;
+                if self.sample_buffer.len() < APU_SAMPLES_PER_FRAME * 2 {
+                    self.sample_buffer.push(mix); self.sample_buffer.push(mix);
+                }
+            } else { self.sample_timer -= 1; }
+        }
+    }
+    pub fn drain_samples(&mut self) -> Vec<i16> {
+        let out = self.sample_buffer.clone(); self.sample_buffer.clear(); out
+    }
+    pub fn write_reg(&mut self, r: u8, v: u8) {
+        match r {
+            0x10=>self.sq1.nr0=v, 0x11=>self.sq1.nr1=v, 0x12=>self.sq1.nr2=v,
+            0x13=>self.sq1.nr3=v, 0x14=>{ self.sq1.nr4=v; if v&0x80!=0 {self.sq1.trigger();} }
+            0x16=>self.sq2.nr1=v, 0x17=>self.sq2.nr2=v, 0x18=>self.sq2.nr3=v,
+            0x19=>{ self.sq2.nr4=v; if v&0x80!=0 {self.sq2.trigger();} }
+            0x1A=>self.wave.nr0=v, 0x1B=>self.wave.nr1=v, 0x1C=>self.wave.nr2=v,
+            0x1D=>self.wave.nr3=v, 0x1E=>{ self.wave.nr4=v; if v&0x80!=0 {self.wave.enabled=true;} }
+            0x20=>self.noise.nr1=v, 0x21=>self.noise.nr2=v, 0x22=>self.noise.nr3=v,
+            0x23=>{ self.noise.nr4=v; if v&0x80!=0 {self.noise.trigger();} }
+            0x24=>self.master_vol=v, 0x26=>self.power=v&0x80!=0,
+            0x30..=0x3F=>self.wave.wave_ram[(r-0x30) as usize]=v,
+            _=>{}
+        }
+    }
+}
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+
+// ── Timer ─────────────────────────────────────────────────────────────────────
+#[derive(Debug, Clone, Default)]
+pub struct Timer {
+    pub div: u8, pub tima: u8, pub tma: u8, pub tac: u8,
+    div_counter: u16, tima_counter: u32, pub overflow_irq: bool,
+}
+impl Timer {
+    pub fn step(&mut self, cycles: u8) {
+        self.overflow_irq = false;
+        self.div_counter = self.div_counter.wrapping_add(cycles as u16);
+        self.div = (self.div_counter >> 8) as u8;
+        if self.tac & 0x04 == 0 { return; }
+        let period: u32 = match self.tac & 0x03 { 0=>1024, 1=>16, 2=>64, 3=>256, _=>1024 };
+        self.tima_counter += cycles as u32;
+        while self.tima_counter >= period {
+            self.tima_counter -= period;
+            let (t, ov) = self.tima.overflowing_add(1);
+            if ov { self.tima = self.tma; self.overflow_irq = true; } else { self.tima = t; }
+        }
+    }
+    pub fn write(&mut self, r: u8, v: u8) {
+        match r { 0x04=>{self.div_counter=0;self.div=0;} 0x05=>self.tima=v, 0x06=>self.tma=v, 0x07=>self.tac=v&0x07, _=>{} }
+    }
+    pub fn read(&self, r: u8) -> u8 {
+        match r { 0x04=>self.div, 0x05=>self.tima, 0x06=>self.tma, 0x07=>self.tac, _=>0xFF }
+    }
+}
+
+// ── Bus ───────────────────────────────────────────────────────────────────────
+
+// ── Bus (Phase 4) ─────────────────────────────────────────────────────────────
+pub struct Bus {
+    pub rom: Vec<u8>, pub ram: Vec<u8>,
+    pub vram: [u8; 0x2000], pub wram: [u8; 0x2000],
+    pub hram: [u8; 0x7F], pub oam: [u8; 0xA0],
+    pub io: [u8; 0x80], pub ie: u8, pub if_reg: u8,
+    pub mbc: Mbc, pub ppu: Ppu, pub apu: Apu, pub timer: Timer,
+    pub joypad: u8,
+}
+impl Bus {
+    pub fn new(cart: Cartridge) -> Self {
+        let mbc = Mbc::new(cart.kind.clone());
+        Bus { rom: cart.rom, ram: cart.ram, vram: [0u8;0x2000], wram: [0u8;0x2000],
+              hram: [0u8;0x7F], oam: [0u8;0xA0], io: [0u8;0x80], ie: 0, if_reg: 0,
+              mbc, ppu: Ppu::new(), apu: Apu::default(), timer: Timer::default(), joypad: 0xFF }
+    }
+    pub fn read(&self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x7FFF => { let m=self.mbc.rom_addr(addr); self.rom.get(m).copied().unwrap_or(0xFF) }
+            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize],
+            0xA000..=0xBFFF => {
+                if self.mbc.ram_enable {
+                    let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
+                    self.ram.get(off).copied().unwrap_or(0xFF)
+                } else { 0xFF }
+            }
+            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize],
+            0xE000..=0xFDFF => self.wram[(addr-0xE000) as usize],
+            0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize],
+            0xFF00 => self.joypad,
+            0xFF01..=0xFF03 => self.io[(addr-0xFF00) as usize],
+            0xFF04..=0xFF07 => self.timer.read((addr-0xFF00) as u8),
+            0xFF0F => self.if_reg,
+            0xFF10..=0xFF3F => 0xFF,
+            0xFF40..=0xFF4B => self.ppu.read_reg((addr-0xFF00) as u8),
+            0xFF46 => 0xFF,
+            0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize],
+            0xFFFF => self.ie,
+            _ => 0xFF,
+        }
+    }
+    pub fn write(&mut self, addr: u16, val: u8) {
+        if self.mbc.write(addr, val) { return; }
+        match addr {
+            0x8000..=0x9FFF => self.vram[(addr-0x8000) as usize] = val,
+            0xA000..=0xBFFF => {
+                if self.mbc.ram_enable {
+                    let off = self.mbc.ram_bank as usize * 0x2000 + (addr-0xA000) as usize;
+                    if off < self.ram.len() { self.ram[off] = val; }
+                }
+            }
+            0xC000..=0xDFFF => self.wram[(addr-0xC000) as usize] = val,
+            0xFE00..=0xFE9F => self.oam[(addr-0xFE00) as usize] = val,
+            0xFF00 => self.joypad = val,
+            0xFF04..=0xFF07 => self.timer.write((addr-0xFF00) as u8, val),
+            0xFF0F => self.if_reg = val,
+            0xFF10..=0xFF3F => self.apu.write_reg((addr-0xFF00) as u8, val),
+            0xFF40..=0xFF4B => self.ppu.write_reg((addr-0xFF00) as u8, val),
+            0xFF46 => { let src=(val as u16)<<8; for i in 0..0xA0u16 { let b=self.read(src+i); self.oam[i as usize]=b; } }
+            0xFF80..=0xFFFE => self.hram[(addr-0xFF80) as usize] = val,
+            0xFFFF => self.ie = val,
+            _ => {}
+        }
+    }
+    pub fn step_subsystems(&mut self, cycles: u8) {
+        let vram = self.vram; let oam = self.oam;
+        self.ppu.step(cycles, &vram, &oam);
+        if self.ppu.vblank_irq { self.if_reg |= 0x01; }
+        if self.ppu.stat_irq   { self.if_reg |= 0x02; }
+        self.timer.step(cycles);
+        if self.timer.overflow_irq { self.if_reg |= 0x04; }
+        self.apu.step(cycles);
+    }
+}
+
+// ── Clock ─────────────────────────────────────────────────────────────────────
+#[derive(Debug, Default, Clone)]
+pub struct Clock { pub t_cycles: u64 }
+impl Clock {
+    pub fn tick(&mut self, c: u8) { self.t_cycles = self.t_cycles.wrapping_add(c as u64); }
+    pub fn frame_count(&self) -> u64 { self.t_cycles / CYCLES_PER_FRAME }
+    pub fn current_scanline(&self) -> u32 { ((self.t_cycles % CYCLES_PER_FRAME) / DOTS_PER_LINE as u64) as u32 }
+}
+
+// ── Training data ─────────────────────────────────────────────────────────────
+fn fnv1a(data: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for &b in data { h ^= b as u32; h = h.wrapping_mul(0x01000193); }
+    h
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameRecord {
+    pub frame: u64, pub t_cycles: u64,
+    pub pc: u16, pub sp: u16, pub a: u8, pub f: u8,
+    pub bc: u16, pub de: u16, pub hl: u16,
+    pub halted: bool, pub ime: bool,
+    pub ly: u8, pub lcdc: u8, pub ppu_mode: u8,
+    pub vblank_count: u64,
+    pub framebuffer: Vec<u8>,
+    pub sq1_on: bool, pub sq2_on: bool, pub wave_on: bool, pub noise_on: bool,
+    pub rom_bank: u16, pub ram_bank: u8,
+    pub wram_hash: u32, pub vram_hash: u32, pub oam_hash: u32,
+    pub rom_title: String,
+}
+
+// ── CPU decode ────────────────────────────────────────────────────────────────
 fn decode(op: u8, bus: &Bus, pc: u16) -> (u8, i16) {
     match op {
         0x00=>(4,1), 0x01|0x11|0x21|0x31=>(12,3), 0x02|0x12|0x0A|0x1A=>(8,1),

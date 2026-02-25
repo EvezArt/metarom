@@ -1,0 +1,158 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MROM Training Record",
+  "description": "Per-ROM gameplay training file produced by MetaROM letsplay_train",
+  "type": "object",
+  "required": [
+    "version",
+    "rom_title",
+    "rom_sha",
+    "total_frames",
+    "frames"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "mrom.train.v1"
+    },
+    "rom_title": {
+      "type": "string"
+    },
+    "rom_sha": {
+      "type": "string"
+    },
+    "rom_size_bytes": {
+      "type": "integer"
+    },
+    "mbc_kind": {
+      "type": "string"
+    },
+    "epoch": {
+      "type": "string",
+      "description": "Console war training epoch"
+    },
+    "total_frames": {
+      "type": "integer"
+    },
+    "total_cycles": {
+      "type": "integer"
+    },
+    "frames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "frame",
+          "t_cycles",
+          "pc",
+          "ly",
+          "framebuffer"
+        ],
+        "properties": {
+          "frame": {
+            "type": "integer"
+          },
+          "t_cycles": {
+            "type": "integer"
+          },
+          "pc": {
+            "type": "integer",
+            "description": "Program counter"
+          },
+          "sp": {
+            "type": "integer"
+          },
+          "a": {
+            "type": "integer"
+          },
+          "f": {
+            "type": "integer",
+            "description": "Flags register"
+          },
+          "bc": {
+            "type": "integer"
+          },
+          "de": {
+            "type": "integer"
+          },
+          "hl": {
+            "type": "integer"
+          },
+          "halted": {
+            "type": "boolean"
+          },
+          "ime": {
+            "type": "boolean"
+          },
+          "ly": {
+            "type": "integer",
+            "description": "PPU scanline"
+          },
+          "lcdc": {
+            "type": "integer"
+          },
+          "ppu_mode": {
+            "type": "integer",
+            "enum": [
+              0,
+              1,
+              2,
+              3
+            ]
+          },
+          "vblank_count": {
+            "type": "integer"
+          },
+          "framebuffer": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            "description": "160x144 flat 2bpp framebuffer"
+          },
+          "sq1_on": {
+            "type": "boolean"
+          },
+          "sq2_on": {
+            "type": "boolean"
+          },
+          "wave_on": {
+            "type": "boolean"
+          },
+          "noise_on": {
+            "type": "boolean"
+          },
+          "samples": {
+            "type": "integer"
+          },
+          "rom_bank": {
+            "type": "integer"
+          },
+          "ram_bank": {
+            "type": "integer"
+          },
+          "wram_hash": {
+            "type": "integer"
+          },
+          "vram_hash": {
+            "type": "integer"
+          },
+          "oam_hash": {
+            "type": "integer"
+          },
+          "rom_title": {
+            "type": "string"
+          },
+          "mbc_kind": {
+            "type": "string"
+          },
+          "epoch": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}
