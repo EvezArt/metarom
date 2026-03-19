@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "ecosystem": "metarom",
+  "updated_at": "2026-03-19",
+  "versions": {
+    "python": "3.11",
+    "fastapi": "0.115.0",
+    "uvicorn": "0.30.0",
+    "pydantic": "2.9.2"
+  }
+}
